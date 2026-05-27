@@ -9,7 +9,7 @@
       "api": "rdk:service:generic",
       "model": "clint:cube-sorter:cube-sorter",
       "short_description": "The business logic service for sorting cubes into bowls",
-      "markdown_link": "README.md#model-devrelcube-sortercube-sorter"
+      "markdown_link": "README.md#model-clintcube-sortercube-sorter"
     }
   ],
   "applications": null,

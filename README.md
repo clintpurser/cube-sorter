@@ -25,7 +25,7 @@ arms to a teleoperation module, then `resume` to re-detect and continue.
   - A vision service that supports both `GetObjectPointClouds` and `DetectionsFromCamera`,
     emitting labels that match that arm's zone labels
 
-## Model devrel:cube-sorter:cube-sorter
+## Model clint:cube-sorter:cube-sorter
 
 The business logic service for sorting colored blocks into bins, or other arbitrary pick and place
 tasks.
