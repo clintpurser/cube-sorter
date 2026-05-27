@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+
 	"cube_sorter"
+
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	generic "go.viam.com/rdk/services/generic"
@@ -22,9 +24,9 @@ func realMain() error {
 	deps := resource.Dependencies{}
 	// can load these from a remote machine if you need
 
-	cfg := picknplace.Config{}
+	cfg := cube_sorter.Config{}
 
-	thing, err := picknplace.NewPicker(ctx, deps, generic.Named("foo"), &cfg, logger)
+	thing, err := cube_sorter.NewSorter(ctx, deps, generic.Named("foo"), &cfg, logger)
 	if err != nil {
 		return err
 	}

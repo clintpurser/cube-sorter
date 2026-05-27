@@ -1,13 +1,13 @@
 {
   "$schema": "https://dl.viam.dev/module.schema.json",
-  "module_id": "devrel:cube-sorter",
-  "visibility": "public",
-  "url": "https://github.com/viam-devrel/cube-sorter",
-  "description": "The business logic service for sorting cubes into bowls",
+  "module_id": "clint:cube-sorter-demo",
+  "visibility": "public_unlisted",
+  "url": "https://github.com/clintpurser/cube-sorter",
+  "description": "The business logic service for sorting cubes into bowls. copied from the viam dev rel version, modified for the teleop demo.",
   "models": [
     {
       "api": "rdk:service:generic",
-      "model": "devrel:cube-sorter:cube-sorter",
+      "model": "clint:cube-sorter:cube-sorter",
       "short_description": "The business logic service for sorting cubes into bowls",
       "markdown_link": "README.md#model-devrelcube-sortercube-sorter"
     }

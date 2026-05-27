@@ -3,40 +3,23 @@ package cube_sorter
 import (
 	"context"
 	"fmt"
-	"slices"
 	"sync"
-	"time"
 
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/components/camera"
 	"go.viam.com/rdk/components/gripper"
-	"go.viam.com/rdk/components/switch"
+	toggleswitch "go.viam.com/rdk/components/switch"
 	"go.viam.com/rdk/logging"
-	"go.viam.com/rdk/motionplan"
-	"go.viam.com/rdk/motionplan/armplanning"
-	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/robot"
 	generic "go.viam.com/rdk/services/generic"
 	"go.viam.com/rdk/services/motion"
 	"go.viam.com/rdk/services/vision"
-	"go.viam.com/rdk/spatialmath"
-	viz "go.viam.com/rdk/vision"
 
 	"github.com/erh/vmodutils"
 )
 
-var Sorter = resource.NewModel("devrel", "cube-sorter", "cube-sorter")
-var constraints = motionplan.Constraints{
-	LinearConstraint: []motionplan.LinearConstraint{
-		{
-			LineToleranceMm:          5,
-			OrientationToleranceDegs: 1,
-		},
-	},
-}
-
-const PICK_HEIGHT = 90
+var Sorter = resource.NewModel("clint", "cube-sorter", "cube-sorter")
 
 func init() {
 	resource.RegisterService(generic.API, Sorter,
@@ -46,69 +29,25 @@ func init() {
 	)
 }
 
-type Config struct {
-	Arm       string `json:"arm_name"`
-	Cam       string `json:"camera_name"`
-	Gripper   string `json:"gripper_name"`
-	Segmenter string `json:"segmenter_name"`
-
-	StartPose string            `json:"start_pose"`
-	Placement map[string]string `json:"placement"`
-
-	Motion string `json:"motion_service,omitempty"`
-
-	GripperLength float64 `json:"gripper_length,omitempty"`
-	CubeHeight    float64 `json:"cube_height,omitempty"`
-}
-
-// Validate ensures all parts of the config are valid and important fields exist.
-// Returns implicit required (first return) and optional (second return) dependencies based on the config.
-// The path is the JSON path in your robot's config (not the `Config` struct) to the
-// resource being validated; e.g. "components.0".
-func (cfg *Config) Validate(path string) ([]string, []string, error) {
-	deps := []string{cfg.Arm, cfg.Cam, cfg.Gripper, cfg.Segmenter, cfg.StartPose}
-
-	if cfg.Motion == "" {
-		cfg.Motion = motion.Named("builtin").String()
-	}
-	deps = append(deps, cfg.Motion)
-
-	for _, pose := range cfg.Placement {
-		deps = append(deps, pose)
-	}
-
-	return deps, nil, nil
-}
-
+// sorter is a thin coordinator over one armWorker per configured arm. It owns
+// the shared motion service and the motionMu that serializes arm motion so only
+// one arm moves at a time.
 type sorter struct {
 	resource.AlwaysRebuild
 
-	name resource.Name
-
+	name   resource.Name
 	logger logging.Logger
 	cfg    *Config
 
 	cancelCtx  context.Context
 	cancelFunc func()
 
-	// config
-	gripperLength float64
-	cubeHeight    float64
+	motion   motion.Service
+	client   robot.Robot
+	motionMu sync.Mutex
 
-	// service deps
-	arm        arm.Arm
-	cam        camera.Camera
-	gripper    gripper.Gripper
-	segmenter  vision.Service
-	startPose  toggleswitch.Switch
-	placePoses map[string]toggleswitch.Switch
-	motion     motion.Service
-	client     robot.Robot
-
-	// state
-	status          string
-	detectedObjects []DetectedObject
-	mu              sync.RWMutex
+	workers []*armWorker
+	wg      sync.WaitGroup
 }
 
 func newSorter(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
@@ -116,65 +55,16 @@ func newSorter(ctx context.Context, deps resource.Dependencies, rawConf resource
 	if err != nil {
 		return nil, err
 	}
-
-	if conf.Motion == "" {
-		conf.Motion = "builtin"
-	}
-
-	if conf.GripperLength == 0.0 {
-		conf.GripperLength = 60.0
-	}
-	if conf.CubeHeight == 0.0 {
-		conf.CubeHeight = 30.0
-	}
-
 	return NewSorter(ctx, deps, rawConf.ResourceName(), conf, logger)
 }
 
 func NewSorter(ctx context.Context, deps resource.Dependencies, name resource.Name, conf *Config, logger logging.Logger) (resource.Resource, error) {
 	robotClient, err := vmodutils.ConnectToMachineFromEnv(ctx, logger)
-
 	if err != nil {
 		return nil, err
 	}
 
-	logger.Info("Following placement poses: ", conf.Placement)
-
-	armDep, err := arm.FromProvider(deps, conf.Arm)
-	if err != nil {
-		return nil, err
-	}
-
-	gripperDep, err := gripper.FromProvider(deps, conf.Gripper)
-	if err != nil {
-		return nil, err
-	}
-
-	cam, err := camera.FromProvider(deps, conf.Cam)
-	if err != nil {
-		return nil, err
-	}
-
-	startPose, err := toggleswitch.FromProvider(deps, conf.StartPose)
-	if err != nil {
-		return nil, err
-	}
-
-	placePoses := map[string]toggleswitch.Switch{}
-	for key, pose := range conf.Placement {
-		poseSwitch, err := toggleswitch.FromProvider(deps, pose)
-		if err != nil {
-			return nil, err
-		}
-		placePoses[key] = poseSwitch
-	}
-
-	segmenter, err := vision.FromProvider(deps, conf.Segmenter)
-	if err != nil {
-		return nil, err
-	}
-
-	motionSvc, err := motion.FromProvider(deps, conf.Motion)
+	motionSvc, err := motion.FromProvider(deps, conf.motionService())
 	if err != nil {
 		return nil, err
 	}
@@ -187,21 +77,88 @@ func NewSorter(ctx context.Context, deps resource.Dependencies, name resource.Na
 		cfg:        conf,
 		cancelCtx:  cancelCtx,
 		cancelFunc: cancelFunc,
-
-		client:        robotClient,
-		arm:           armDep,
-		cam:           cam,
-		gripper:       gripperDep,
-		segmenter:     segmenter,
-		motion:        motionSvc,
-		startPose:     startPose,
-		placePoses:    placePoses,
-		gripperLength: conf.GripperLength,
-		cubeHeight:    conf.CubeHeight,
-
-		status: "idle",
+		motion:     motionSvc,
+		client:     robotClient,
 	}
+
+	for _, unit := range conf.units() {
+		w, err := s.buildWorker(deps, unit)
+		if err != nil {
+			cancelFunc()
+			return nil, err
+		}
+		s.workers = append(s.workers, w)
+	}
+
+	for _, w := range s.workers {
+		s.wg.Add(1)
+		go w.run(&s.wg)
+	}
+
+	logger.Infof("cube-sorter started with %d arm(s)", len(s.workers))
 	return s, nil
+}
+
+func (s *sorter) buildWorker(deps resource.Dependencies, unit ArmUnit) (*armWorker, error) {
+	armDep, err := arm.FromProvider(deps, unit.Arm)
+	if err != nil {
+		return nil, err
+	}
+	gripperDep, err := gripper.FromProvider(deps, unit.Gripper)
+	if err != nil {
+		return nil, err
+	}
+	camDep, err := camera.FromProvider(deps, unit.Cam)
+	if err != nil {
+		return nil, err
+	}
+	segDep, err := vision.FromProvider(deps, unit.Segmenter)
+	if err != nil {
+		return nil, err
+	}
+	startPose, err := toggleswitch.FromProvider(deps, unit.StartPose)
+	if err != nil {
+		return nil, err
+	}
+
+	pitch := unit.BlockSize + unit.Margin
+	zones := map[string]*zoneState{}
+	for _, z := range unit.Zones {
+		anchor, err := toggleswitch.FromProvider(deps, z.AnchorPose)
+		if err != nil {
+			return nil, err
+		}
+		inspect, err := toggleswitch.FromProvider(deps, z.InspectPose)
+		if err != nil {
+			return nil, err
+		}
+		zones[z.Label] = &zoneState{
+			cfg:     z,
+			anchor:  anchor,
+			inspect: inspect,
+			pitch:   pitch,
+		}
+	}
+
+	return &armWorker{
+		name:         unit.Arm,
+		logger:       s.logger,
+		arm:          armDep,
+		cam:          camDep,
+		gripper:      gripperDep,
+		segmenter:    segDep,
+		startPose:    startPose,
+		zones:        zones,
+		cubeHeight:   unit.CubeHeight,
+		graspZOffset: unit.GraspZOffset,
+		approachYaw:  unit.ApproachYaw,
+		motion:       s.motion,
+		client:       s.client,
+		motionMu:     &s.motionMu,
+		parentCtx:    s.cancelCtx,
+		cmdCh:        make(chan cmdKind, 1),
+		state:        stateIdle,
+	}, nil
 }
 
 func (s *sorter) Name() resource.Name {
@@ -211,306 +168,86 @@ func (s *sorter) Name() resource.Name {
 func (s *sorter) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	switch cmd["command"] {
 	case "start":
-		err := s.Start()
+		for _, w := range s.workers {
+			w.trigger(cmdStart)
+		}
+		return map[string]any{"success": true, "status": "started"}, nil
+
+	case "resume":
+		for _, w := range s.workers {
+			w.resume()
+		}
+		return map[string]any{"success": true, "status": "resumed"}, nil
+
+	case "stop":
+		err := s.forEach(func(w *armWorker) error { return w.stop() })
 		return map[string]any{"success": err == nil}, err
 
 	case "reset":
-		err := s.Reset()
+		err := s.forEach(func(w *armWorker) error { return w.reset() })
 		return map[string]any{"success": err == nil}, err
 
 	case "get_detected_objects":
-		err := s.GetDetectedObjects(ctx)
-		serializedObjs := s.serializeDetectedObjects()
-		return map[string]any{"success": err == nil, "objects": serializedObjs}, err
+		result := map[string]any{}
+		err := s.forEach(func(w *armWorker) error {
+			objs, derr := w.detectOnly()
+			result[w.name] = objs
+			return derr
+		})
+		return map[string]any{"success": err == nil, "objects": result}, err
 
 	case "pick_object":
-		selectedObjectLabel, ok := cmd["label"].(string)
+		label, ok := cmd["label"].(string)
 		if !ok {
-			return nil, fmt.Errorf("pick_object command requires 'label' string parameter")
+			return nil, fmt.Errorf("pick_object requires a 'label' string parameter")
 		}
-		err := s.PickObject(ctx, selectedObjectLabel)
-		if err == nil {
-			s.removeDetectedObjectFromList(selectedObjectLabel)
+		w := s.workerForLabel(label)
+		if w == nil {
+			return nil, fmt.Errorf("no configured arm owns label %q", label)
 		}
+		err := w.pickByLabel(label)
 		return map[string]any{"success": err == nil}, err
 
 	case "get_status":
-		status, err := s.Status()
-		serializedObjs := s.serializeDetectedObjects()
-		return map[string]any{"success": err == nil, "status": status, "detected_objects": serializedObjs}, err
+		return map[string]any{"success": true, "arms": s.aggregateStatus()}, nil
 	}
 
-	return nil, fmt.Errorf("unknown command: %v", cmd)
+	return nil, fmt.Errorf("unknown command: %v", cmd["command"])
 }
 
-func (s *sorter) Start() error {
-	ctx := s.cancelCtx
-
-	s.status = "searching_for_objects"
-
-	err := s.GetDetectedObjects(ctx)
-	if err != nil {
-		return err
-	}
-
-	objects := slices.Clone(s.detectedObjects)
-	s.logger.Debugf("Detected objects: %v", objects)
-	for _, obj := range objects {
-		s.logger.Debugf("Next object: %v", obj)
-		err = s.PickObject(ctx, obj.Label)
-		if err != nil {
-			return err
-		}
-		s.removeDetectedObjectFromList(obj.Label)
-	}
-
-	s.mu.Lock()
-	clear(s.detectedObjects)
-	s.mu.Unlock()
-
-	return nil
-}
-
-func (s *sorter) GetDetectedObjects(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	clear(s.detectedObjects)
-
-	s.logger.Info("Going to start position")
-	err := s.startPose.SetPosition(ctx, 2, nil)
-	if err != nil {
-		return err
-	}
-
-	time.Sleep(time.Millisecond * 500)
-
-	s.logger.Info("Getting objects from camera")
-
-	objs, err := s.segmenter.GetObjectPointClouds(ctx, "", nil)
-	if err != nil {
-		return err
-	}
-
-	dets, err := s.segmenter.DetectionsFromCamera(ctx, "", nil)
-	if err != nil {
-		return err
-	}
-
-	if len(objs) == 0 {
-		return fmt.Errorf("No objects found to sort")
-	}
-
-	for _, obj := range objs {
-		label := obj.Geometry.Label()
-		for _, det := range dets {
-			if det.Label() == label {
-				s.detectedObjects = append(s.detectedObjects, DetectedObject{Label: label, Object: *obj, Detection: det})
-				break
-			}
+// forEach runs fn on every worker and returns the first error (after running all).
+func (s *sorter) forEach(fn func(*armWorker) error) error {
+	var firstErr error
+	for _, w := range s.workers {
+		if err := fn(w); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
-	s.status = "objects_detected"
-
-	return nil
+	return firstErr
 }
 
-func (s *sorter) PickObject(ctx context.Context, selectedObjectLabel string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.logger.Debugf("Picking object with label: %s", selectedObjectLabel)
-	s.status = "finding_object_pose"
-
-	var selectedObj *viz.Object
-	for _, obj := range s.detectedObjects {
-		if obj.Label == selectedObjectLabel {
-			selectedObj = &obj.Object
-			break
+func (s *sorter) workerForLabel(label string) *armWorker {
+	for _, w := range s.workers {
+		if w.ownsLabel(label) {
+			return w
 		}
 	}
-	if selectedObj == nil {
-		return fmt.Errorf("Unable to find matching object with label %s", selectedObjectLabel)
-	}
-
-	objLabel := selectedObj.Geometry.Label()
-	armName := s.arm.Name().ShortName()
-
-	objInWorld, err := s.client.TransformPointCloud(ctx, selectedObj, s.cam.Name().ShortName(), "world")
-	if err != nil {
-		return err
-	}
-	objMd := objInWorld.MetaData()
-	pickPoint := objMd.Center()
-	pickPoint.Z = objMd.MaxZ + s.gripperLength
-
-	s.logger.Infof("Pick point: %v", pickPoint)
-
-	pickPoint.Z = s.cubeHeight + s.gripperLength
-
-	// set approach height
-	approachPoint := pickPoint
-	approachPoint.Z += 100
-
-	currentPose, err := s.motion.GetPose(ctx, armName, "world", nil, nil)
-	movingOrientation := spatialmath.OrientationVectorDegrees{
-		OZ:    -1,
-		Theta: currentPose.Pose().Orientation().OrientationVectorDegrees().Theta,
-	}
-
-	approachPose := referenceframe.NewPoseInFrame("world", spatialmath.NewPose(approachPoint, &movingOrientation))
-
-	s.logger.Infof("trying to move to %v", approachPose.Pose())
-
-	plan := armplanning.NewPlanState(
-		referenceframe.FrameSystemPoses{
-			s.arm.Name().ShortName(): approachPose,
-		},
-		referenceframe.FrameSystemInputs{},
-	)
-
-	err = s.gripper.Open(ctx, nil)
-	if err != nil {
-		return err
-	}
-
-	// drop to pick height
-	pickPose := referenceframe.NewPoseInFrame("world", spatialmath.NewPose(pickPoint, &movingOrientation))
-
-	s.status = "picking"
-
-	_, err = s.motion.Move(context.Background(), motion.MoveReq{
-		ComponentName: armName,
-		Destination:   pickPose,
-		Constraints:   &constraints,
-		Extra: map[string]any{
-			"waypoints": []any{plan.Serialize()},
-		},
-	})
-
-	if err != nil {
-		return err
-	}
-
-	time.Sleep(time.Millisecond * 500)
-
-	_, err = s.gripper.Grab(ctx, nil)
-	if err != nil {
-		return nil
-	}
-
-	time.Sleep(time.Millisecond * 250)
-
-	// raise to place movement height
-	pickupPoint := pickPoint
-	pickupPoint.Z += 150
-
-	err = s.arm.MoveToPosition(ctx, spatialmath.NewPose(pickupPoint, &movingOrientation), nil)
-	if err != nil {
-		return err
-	}
-
-	s.status = "placing"
-
-	placePose, ok := s.placePoses[objLabel]
-	if !ok {
-		return fmt.Errorf("Unable to find pose to place %s", objLabel)
-	}
-	s.logger.Infof("Going to place position for %s", objLabel)
-	err = placePose.SetPosition(ctx, 2, nil)
-	if err != nil {
-		return err
-	}
-
-	time.Sleep(time.Millisecond * 1000)
-
-	err = s.gripper.Open(ctx, nil)
-	if err != nil {
-		return err
-	}
-
-	time.Sleep(time.Millisecond * 250)
-
-	s.logger.Info("Returning to start position")
-	err = s.startPose.SetPosition(ctx, 2, nil)
-	if err != nil {
-		return err
-	}
-
-	s.status = "idle"
-
 	return nil
 }
 
-func (s *sorter) Status() (string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.status, nil
-}
-
-func (s *sorter) Reset() error {
-	s.mu.Lock()
-	s.status = "resetting"
-	s.mu.Unlock()
-
-	ctx := s.cancelCtx
-
-	s.logger.Info("Stopping arm")
-	err := s.arm.Stop(ctx, nil)
-	if err != nil {
-		return err
+func (s *sorter) aggregateStatus() map[string]any {
+	out := map[string]any{}
+	for _, w := range s.workers {
+		out[w.name] = map[string]any{
+			"status":           string(w.status()),
+			"detected_objects": w.serializeDetected(),
+		}
 	}
-
-	s.logger.Info("Opening gripper")
-	err = s.gripper.Open(ctx, nil)
-	if err != nil {
-		return err
-	}
-
-	s.logger.Info("Returning to start pose")
-	err = s.startPose.SetPosition(ctx, 2, nil)
-	if err != nil {
-		return err
-	}
-
-	s.mu.Lock()
-	s.status = "idle"
-	clear(s.detectedObjects)
-	s.mu.Unlock()
-
-	return nil
+	return out
 }
 
 func (s *sorter) Close(ctx context.Context) error {
-	err := s.client.Close(ctx)
-	if err != nil {
-		return err
-	}
-
 	s.cancelFunc()
-	return nil
-}
-
-func (s *sorter) removeDetectedObjectFromList(selectedObjectLabel string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var objIdx int
-	for idx, obj := range s.detectedObjects {
-		if obj.Label == selectedObjectLabel {
-			objIdx = idx
-			break
-		}
-	}
-	s.detectedObjects = slices.Delete(s.detectedObjects, objIdx, objIdx+1)
-}
-
-func (s *sorter) serializeDetectedObjects() []any {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	serializedObjs := []any{}
-	for _, obj := range s.detectedObjects {
-		serializedObjs = append(serializedObjs, obj.Serialize())
-	}
-	return serializedObjs
+	s.wg.Wait()
+	return s.client.Close(ctx)
 }
