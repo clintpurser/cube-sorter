@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/golang/geo/r3"
+
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/components/camera"
 	"go.viam.com/rdk/components/gripper"
@@ -154,8 +156,9 @@ func (w *armWorker) runCycle(kind cmdKind) {
 				w.logger.Infof("[%s] pick interrupted", w.name)
 				return
 			}
-			// Non-fatal: log and drop this object so the cycle can continue.
-			w.logger.Warnf("[%s] failed to pick %q: %v", w.name, label, err)
+			// Non-fatal for the cycle (we drop this object and continue), but the
+			// operation the caller asked for did fail — log at Error.
+			w.logger.Errorf("[%s] failed to pick %q: %v", w.name, label, err)
 		}
 		w.removeDetected(label)
 	}
@@ -213,10 +216,25 @@ func (w *armWorker) detectFromStart(ctx context.Context, dropHeld, skipMove bool
 			continue
 		}
 		for _, det := range dets {
-			if det.Label() == label {
-				detected = append(detected, DetectedObject{Label: label, Object: *obj, Detection: det})
-				break
+			if det.Label() != label {
+				continue
 			}
+			// Transform the object's point cloud into world and stash the
+			// center so it's visible via get_detected_objects without
+			// needing to attempt a pick. Failures here are non-fatal
+			// (we still report the 2D detection); the pick path will
+			// re-transform when it runs.
+			selected := *obj
+			worldCenter := r3.Vector{}
+			if inWorld, terr := w.client.TransformPointCloud(ctx, &selected, w.cam.Name().ShortName(), "world"); terr == nil {
+				md := inWorld.MetaData()
+				worldCenter = md.Center()
+			} else {
+				w.logger.Warnf("[%s] failed to transform %q point cloud to world: %v", w.name, label, terr)
+			}
+			w.logger.Infof("[%s] detected %q at world %v", w.name, label, worldCenter)
+			detected = append(detected, DetectedObject{Label: label, Object: selected, Detection: det, WorldCenter: worldCenter})
+			break
 		}
 	}
 
