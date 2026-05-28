@@ -170,7 +170,11 @@ func (s *sorter) DoCommand(ctx context.Context, cmd map[string]interface{}) (map
 	switch cmd["command"] {
 	case "start":
 		s.logger.Infof("start sorting called on %d arm(s)", len(s.workers))
-		if err := s.parkAllAtStart(ctx); err != nil {
+		// Detach from the caller's RPC ctx: streamdeck-style handlers cancel
+		// their inbound ctx as soon as the handler returns, which would abort
+		// the in-flight SetPosition calls. The workers themselves already run
+		// on s.cancelCtx (see parentCtx), so use the same lifetime here.
+		if err := s.parkAllAtStart(s.cancelCtx); err != nil {
 			return map[string]any{"success": false}, fmt.Errorf("park at start failed: %w", err)
 		}
 		for _, w := range s.workers {
