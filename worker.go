@@ -9,8 +9,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/golang/geo/r3"
-
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/components/camera"
 	"go.viam.com/rdk/components/gripper"
@@ -224,16 +222,20 @@ func (w *armWorker) detectFromStart(ctx context.Context, dropHeld, skipMove bool
 			// needing to attempt a pick. Failures here are non-fatal
 			// (we still report the 2D detection); the pick path will
 			// re-transform when it runs.
+			// Transform into world NOW, while the camera is still at the
+			// detection pose. We stash the world-frame object so the pick
+			// path can use it directly — re-transforming later would use the
+			// (by then) moved camera pose and yield a wrong world position.
 			selected := *obj
-			worldCenter := r3.Vector{}
-			if inWorld, terr := w.client.TransformPointCloud(ctx, &selected, w.cam.Name().ShortName(), "world"); terr == nil {
-				md := inWorld.MetaData()
-				worldCenter = md.Center()
-			} else {
+			inWorld, terr := w.client.TransformPointCloud(ctx, &selected, w.cam.Name().ShortName(), "world")
+			if terr != nil {
 				w.logger.Warnf("[%s] failed to transform %q point cloud to world: %v", w.name, label, terr)
+				break
 			}
+			md := inWorld.MetaData()
+			worldCenter := md.Center()
 			w.logger.Infof("[%s] detected %q at world %v", w.name, label, worldCenter)
-			detected = append(detected, DetectedObject{Label: label, Object: selected, Detection: det, WorldCenter: worldCenter})
+			detected = append(detected, DetectedObject{Label: label, Object: selected, Detection: det, WorldPC: inWorld, WorldCenter: worldCenter})
 			break
 		}
 	}
@@ -255,12 +257,10 @@ func (w *armWorker) pickOne(ctx context.Context, label string) error {
 
 	w.setState(statePicking)
 
-	selectedObj := obj.Object
-	objInWorld, err := w.client.TransformPointCloud(ctx, &selectedObj, w.cam.Name().ShortName(), "world")
-	if err != nil {
-		return err
-	}
-
+	// Use the world-frame point cloud captured at detection time — the camera
+	// has since moved (anchor / inspect poses), so re-transforming the
+	// camera-frame cloud now would project it through the wrong camera pose.
+	objInWorld := obj.WorldPC
 	objMd := objInWorld.MetaData()
 	pickPoint := objMd.Center()
 	// The depth camera mostly sees the top face, so descend cube_height/2 below

@@ -3,18 +3,26 @@ package cube_sorter
 import (
 	"github.com/golang/geo/r3"
 
+	"go.viam.com/rdk/pointcloud"
 	viz "go.viam.com/rdk/vision"
 	"go.viam.com/rdk/vision/objectdetection"
 )
 
 type DetectedObject struct {
-	Label     string
+	Label string
+	// Object is the point cloud in CAMERA frame as returned by the segmenter.
+	// Don't transform this to world later — the camera will have moved between
+	// detection and pick, and TransformPointCloud uses the frame system as it
+	// stands at the call. Use WorldObject for any world-frame math instead.
 	Object    viz.Object
 	Detection objectdetection.Detection
-	// WorldCenter is the point-cloud center transformed from the camera frame
-	// into the world frame at detection time. Stashed here so callers (and
-	// `get_detected_objects`) can see where the module thinks the object is
-	// without needing to attempt a pick.
+	// WorldPC is Object's point cloud transformed into the world frame at
+	// detection time, while the camera was still at its detection pose. This
+	// is what the pick path uses for grasp geometry.
+	WorldPC pointcloud.PointCloud
+	// WorldCenter is the point-cloud center in world frame (== WorldPC's
+	// MetaData().Center()), surfaced separately for the get_detected_objects
+	// response.
 	WorldCenter r3.Vector
 }
 
