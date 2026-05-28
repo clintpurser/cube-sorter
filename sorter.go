@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/components/camera"
@@ -168,6 +169,10 @@ func (s *sorter) Name() resource.Name {
 func (s *sorter) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	switch cmd["command"] {
 	case "start":
+		s.logger.Infof("start sorting called on %d arm(s)", len(s.workers))
+		if err := s.parkAllAtStart(ctx); err != nil {
+			return map[string]any{"success": false}, fmt.Errorf("park at start failed: %w", err)
+		}
 		for _, w := range s.workers {
 			w.trigger(cmdStart)
 		}
@@ -213,6 +218,34 @@ func (s *sorter) DoCommand(ctx context.Context, cmd map[string]interface{}) (map
 	}
 
 	return nil, fmt.Errorf("unknown command: %v", cmd["command"])
+}
+
+// parkAllAtStart drives every arm to its configured start pose in parallel,
+// then settles. Start poses must be configured collision-safe across arms;
+// this bypasses motionMu intentionally (mirroring viam-pouring-demo's goTo).
+func (s *sorter) parkAllAtStart(ctx context.Context) error {
+	var wg sync.WaitGroup
+	errs := make([]error, len(s.workers))
+	for i, w := range s.workers {
+		i, w := i, w
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = w.startPose.SetPosition(ctx, 2, nil)
+		}()
+	}
+	wg.Wait()
+	for _, e := range errs {
+		if e != nil {
+			return e
+		}
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(500 * time.Millisecond):
+		return nil
+	}
 }
 
 // forEach runs fn on every worker and returns the first error (after running all).

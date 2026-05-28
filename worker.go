@@ -127,7 +127,11 @@ func (w *armWorker) runCycle(kind cmdKind) {
 	w.stopped.Store(false)
 
 	dropHeld := kind == cmdResume
-	if err := w.detectFromStart(ctx, dropHeld); err != nil {
+	// On cmdStart the sorter parks all arms at start in parallel before
+	// triggering, so skip the redundant move (which would re-serialize on
+	// motionMu and erase the parallelism).
+	skipMove := kind == cmdStart
+	if err := w.detectFromStart(ctx, dropHeld, skipMove); err != nil {
 		w.handleCycleErr("detection", err)
 		return
 	}
@@ -170,14 +174,18 @@ func (w *armWorker) handleCycleErr(phase string, err error) {
 
 // detectFromStart drives the arm to its start pose, optionally drops a held
 // block (on resume), then detects this arm's owned colors from its camera.
-func (w *armWorker) detectFromStart(ctx context.Context, dropHeld bool) error {
+// When skipMove is true the start-pose move is skipped — used when the sorter
+// has already parked all arms in parallel.
+func (w *armWorker) detectFromStart(ctx context.Context, dropHeld, skipMove bool) error {
 	w.setState(stateSearching)
 
-	if err := w.setSwitch(ctx, w.startPose); err != nil {
-		return err
-	}
-	if err := w.sleep(ctx, 500*time.Millisecond); err != nil {
-		return err
+	if !skipMove {
+		if err := w.setSwitch(ctx, w.startPose); err != nil {
+			return err
+		}
+		if err := w.sleep(ctx, 500*time.Millisecond); err != nil {
+			return err
+		}
 	}
 
 	if dropHeld {
@@ -338,7 +346,7 @@ func (w *armWorker) setSwitch(ctx context.Context, sw toggleswitch.Switch) error
 func (w *armWorker) detectOnly() ([]any, error) {
 	ctx := w.newOpCtx()
 	w.stopped.Store(false)
-	if err := w.detectFromStart(ctx, false); err != nil {
+	if err := w.detectFromStart(ctx, false, false); err != nil {
 		return w.serializeDetected(), err
 	}
 	return w.serializeDetected(), nil
@@ -351,7 +359,7 @@ func (w *armWorker) pickByLabel(label string) error {
 	w.stopped.Store(false)
 
 	if _, ok := w.lookupDetected(label); !ok {
-		if err := w.detectFromStart(ctx, false); err != nil {
+		if err := w.detectFromStart(ctx, false, false); err != nil {
 			return err
 		}
 	}
