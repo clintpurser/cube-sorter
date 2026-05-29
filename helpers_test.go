@@ -5,8 +5,81 @@ import (
 	"testing"
 
 	"github.com/golang/geo/r3"
+	"go.viam.com/rdk/pointcloud"
 	"go.viam.com/rdk/spatialmath"
 )
+
+// squareCloud builds a dense uniform-grid sample of a square (side 2·halfSide,
+// centered at origin) rotated by yawDeg about Z. Used to drive edgeYawDegrees
+// in tests with a known ground-truth orientation.
+func squareCloud(t *testing.T, halfSide, yawDeg float64, gridSteps int) pointcloud.PointCloud {
+	t.Helper()
+	pc := pointcloud.NewBasicEmpty()
+	c, s := math.Cos(yawDeg*math.Pi/180), math.Sin(yawDeg*math.Pi/180)
+	step := 2 * halfSide / float64(gridSteps-1)
+	for i := 0; i < gridSteps; i++ {
+		for j := 0; j < gridSteps; j++ {
+			x := -halfSide + float64(i)*step
+			y := -halfSide + float64(j)*step
+			rx := c*x - s*y
+			ry := s*x + c*y
+			if err := pc.Set(r3.Vector{X: rx, Y: ry, Z: 0}, nil); err != nil {
+				t.Fatalf("pc.Set: %v", err)
+			}
+		}
+	}
+	return pc
+}
+
+func TestEdgeYawDegreesSquare(t *testing.T) {
+	// 4-fold symmetry means any true yaw φ is equivalent to φ ± 90°·k; fold
+	// expected and actual into (-45°, 45°] before comparing.
+	fold := func(deg float64) float64 {
+		for deg > 45 {
+			deg -= 90
+		}
+		for deg <= -45 {
+			deg += 90
+		}
+		return deg
+	}
+	for _, yaw := range []float64{0, 10, 30, -30, 44, 60, 89} {
+		pc := squareCloud(t, 20, yaw, 21)
+		got, ok := edgeYawDegrees(pc)
+		if !ok {
+			t.Errorf("yaw=%v: edgeYawDegrees returned ok=false", yaw)
+			continue
+		}
+		if diff := math.Abs(fold(got - yaw)); diff > 0.5 {
+			t.Errorf("yaw=%v: got %v (folded diff %v°)", yaw, got, diff)
+		}
+	}
+}
+
+func TestEdgeYawDegreesIsotropicRejected(t *testing.T) {
+	// A dense disc has no 4-fold structure; the anisotropy threshold should
+	// reject it so callers fall back to approachYaw.
+	pc := pointcloud.NewBasicEmpty()
+	const r = 20.0
+	for i := 0; i < 4000; i++ {
+		theta := 2 * math.Pi * float64(i) / 4000
+		// Fibonacci-ish radial fill to cover the disc roughly uniformly.
+		rad := r * math.Sqrt(float64(i%200)/200.0)
+		if err := pc.Set(r3.Vector{X: rad * math.Cos(theta), Y: rad * math.Sin(theta)}, nil); err != nil {
+			t.Fatalf("pc.Set: %v", err)
+		}
+	}
+	if _, ok := edgeYawDegrees(pc); ok {
+		t.Error("expected isotropic disc to be rejected, got ok=true")
+	}
+}
+
+func TestEdgeYawDegreesSparseRejected(t *testing.T) {
+	pc := squareCloud(t, 20, 0, 3) // 9 points < minMomentPoints (10)
+	if _, ok := edgeYawDegrees(pc); ok {
+		t.Error("expected sparse cloud to be rejected, got ok=true")
+	}
+}
 
 func TestNormalizeYaw(t *testing.T) {
 	cases := []struct {
