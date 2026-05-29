@@ -56,6 +56,49 @@ func TestEdgeYawDegreesSquare(t *testing.T) {
 	}
 }
 
+// TestEdgeYawDegreesNoisyCube reproduces the regime that broke the 4th-moment
+// estimator: a square silhouette with a slight asymmetric "tongue" of extra
+// points on one side, mimicking partial visibility of a cube face. PCA can't
+// see a 4-fold-symmetric shape at all and 4th moments flip the answer by 45°
+// when the asymmetry tips Re(E[Z^4]) sign. The bbox search should still lock
+// onto the dominant square edges.
+func TestEdgeYawDegreesNoisyCube(t *testing.T) {
+	fold := func(deg float64) float64 {
+		for deg > 45 {
+			deg -= 90
+		}
+		for deg <= -45 {
+			deg += 90
+		}
+		return deg
+	}
+	for _, yaw := range []float64{0, 22.5, 30, -30, 44} {
+		pc := squareCloud(t, 20, yaw, 21)
+		// Add an asymmetric strip along the (rotated) +X side to mimic a partly-
+		// visible cube face leaking into the silhouette.
+		c, s := math.Cos(yaw*math.Pi/180), math.Sin(yaw*math.Pi/180)
+		for i := 0; i < 5; i++ {
+			for j := -5; j <= 5; j++ {
+				x := 20.0 + float64(i)*1.0
+				y := float64(j) * 1.0
+				rx := c*x - s*y
+				ry := s*x + c*y
+				if err := pc.Set(r3.Vector{X: rx, Y: ry, Z: 0}, nil); err != nil {
+					t.Fatalf("pc.Set: %v", err)
+				}
+			}
+		}
+		got, ok := edgeYawDegrees(pc)
+		if !ok {
+			t.Errorf("yaw=%v: edgeYawDegrees returned ok=false", yaw)
+			continue
+		}
+		if diff := math.Abs(fold(got - yaw)); diff > 1.5 {
+			t.Errorf("yaw=%v: got %v (folded diff %v°)", yaw, got, diff)
+		}
+	}
+}
+
 func TestEdgeYawDegreesIsotropicRejected(t *testing.T) {
 	// A dense disc has no 4-fold structure; the anisotropy threshold should
 	// reject it so callers fall back to approachYaw.

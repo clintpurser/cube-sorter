@@ -7,15 +7,19 @@ import (
 	"go.viam.com/rdk/pointcloud"
 )
 
-// minMomentPoints is the floor below which a point cloud is considered too
-// sparse to estimate stable 4th-order central moments.
-const minMomentPoints = 10
+// minYawPoints is the floor below which a point cloud is too sparse to
+// resolve a stable yaw.
+const minYawPoints = 10
 
-// squareAnisotropyThreshold is the minimum value of |E[Z^4]| / E[|Z|^2]^2
-// (where Z = X + iY centered) required to trust the recovered edge angle.
-// That ratio is 0 for a perfect circle and ≈ 0.6 for a perfect uniform square;
-// 0.1 rejects 4-fold-isotropic blobs while still accepting noisy real cubes.
-const squareAnisotropyThreshold = 0.1
+// yawAnisotropyThreshold is the minimum (worstArea / bestArea) across rotation
+// candidates required to trust the recovered yaw. 1.0 = perfectly isotropic
+// (circle), 2.0 = uniform square; 1.1 rejects circular blobs while accepting
+// noisy real cubes.
+const yawAnisotropyThreshold = 1.1
+
+// yawSearchStepDeg is the resolution of the yaw search in (-45°, 45°]. 0.5°
+// is well below the gripper alignment tolerance and keeps the search cheap.
+const yawSearchStepDeg = 0.5
 
 // approachHeightMm is how far above the grasp point the arm first moves before
 // descending straight down onto the block.
@@ -25,69 +29,77 @@ const approachHeightMm = 100
 // the place pose.
 const liftHeightMm = 150
 
-// edgeYawDegrees estimates the yaw (degrees, about world Z) of one of a cube
-// top face's edges from its XY-projected point cloud. 2nd-order moments (PCA)
-// are rotation-invariant for any 4-fold-symmetric shape, so they return noise
-// on a cube; the 4th-order central moments carry the 4-fold structure and
-// resolve a well-defined edge angle in (-45°, 45°]. Returns false if the cloud
-// is too sparse or too 4-fold-isotropic (circular / noisy) to trust.
+// edgeYawDegrees finds the yaw (degrees, about world Z, in (-45°, 45°]) that
+// aligns the cube's top edges with the world X/Y axes, by searching for the
+// rotation that minimizes the axis-aligned bounding-box area of the XY-
+// projected point cloud. At the correct yaw the bounding box hugs the cube's
+// edges; any other yaw inscribes the cube in a strictly larger axis-aligned
+// rectangle (worst case ≈ √2× per side at 45° off, i.e. 2× area).
 //
-// Note: this is calibrated for square-like silhouettes (where Re(E[Z^4]) < 0
-// in the canonical frame). Strongly elongated rectangles flip that sign and
-// would come back rotated 45° off — fine for cubes, not a generic edge finder.
+// This silhouette-geometry approach is robust to the failure modes of moment-
+// based estimators: PCA is rotation-invariant on 4-fold-symmetric shapes, and
+// 4th-order moments suffer a sign ambiguity (square-like vs elongated) that
+// flips the answer by 45° on noisy near-square silhouettes.
+//
+// Returns false if the cloud is too sparse or too isotropic (bbox area varies
+// too little with rotation) to commit to an orientation.
 func edgeYawDegrees(pc pointcloud.PointCloud) (float64, bool) {
 	n := pc.Size()
-	if n < minMomentPoints {
+	if n < minYawPoints {
 		return 0, false
 	}
-	nf := float64(n)
 
-	var sumX, sumY float64
+	// Cache points so the rotation sweep doesn't pay the Iterate cost N times.
+	points := make([]r3.Vector, 0, n)
 	pc.Iterate(0, 0, func(p r3.Vector, _ pointcloud.Data) bool {
-		sumX += p.X
-		sumY += p.Y
-		return true
-	})
-	meanX := sumX / nf
-	meanY := sumY / nf
-
-	var s20, s02 float64
-	var s40, s04, s22, s31, s13 float64
-	pc.Iterate(0, 0, func(p r3.Vector, _ pointcloud.Data) bool {
-		dx := p.X - meanX
-		dy := p.Y - meanY
-		dx2 := dx * dx
-		dy2 := dy * dy
-		s20 += dx2
-		s02 += dy2
-		s40 += dx2 * dx2
-		s04 += dy2 * dy2
-		s22 += dx2 * dy2
-		s31 += dx2 * dx * dy
-		s13 += dx * dy * dy2
+		points = append(points, p)
 		return true
 	})
 
-	// Real and imaginary parts of E[(X+iY)^4]. For a square aligned with the
-	// world axes, im = 0 and re = -4/15·a^4 < 0; under a rotation by φ this
-	// pair traces a circle, multiplied by e^{4iφ}.
-	re := (s40 - 6*s22 + s04) / nf
-	im := 4 * (s31 - s13) / nf
-	r2 := (s20 + s02) / nf
+	bestArea := math.Inf(1)
+	worstArea := math.Inf(-1)
+	var bestDeg float64
+	for deg := -45.0; deg <= 45.0; deg += yawSearchStepDeg {
+		rad := deg * math.Pi / 180
+		cos := math.Cos(rad)
+		sin := math.Sin(rad)
 
-	if r2 < 1e-9 {
+		xMin, yMin := math.Inf(1), math.Inf(1)
+		xMax, yMax := math.Inf(-1), math.Inf(-1)
+		for _, p := range points {
+			// Rotate the point by -deg so the test axes "follow" the candidate yaw.
+			rx := cos*p.X + sin*p.Y
+			ry := -sin*p.X + cos*p.Y
+			if rx < xMin {
+				xMin = rx
+			}
+			if rx > xMax {
+				xMax = rx
+			}
+			if ry < yMin {
+				yMin = ry
+			}
+			if ry > yMax {
+				yMax = ry
+			}
+		}
+		area := (xMax - xMin) * (yMax - yMin)
+		if area < bestArea {
+			bestArea = area
+			bestDeg = deg
+		}
+		if area > worstArea {
+			worstArea = area
+		}
+	}
+
+	if bestArea <= 0 {
 		return 0, false
 	}
-	// Require |E[Z^4]| ≥ threshold · E[|Z|^2]^2 so we don't read a yaw out of
-	// pure noise on a near-circular cloud.
-	if re*re+im*im < squareAnisotropyThreshold*squareAnisotropyThreshold*r2*r2*r2*r2 {
+	if worstArea/bestArea < yawAnisotropyThreshold {
 		return 0, false
 	}
-
-	// E[Z^4] = c · e^{4iφ} with c < 0 (square-like), so arg(E[Z^4]) = π + 4φ
-	// and φ = arg(-E[Z^4]) / 4.
-	angleRad := 0.25 * math.Atan2(-im, -re)
-	return angleRad * 180 / math.Pi, true
+	return bestDeg, true
 }
 
 // graspYawDegrees returns the gripper yaw (degrees) for a two-finger grasp:
@@ -95,7 +107,7 @@ func edgeYawDegrees(pc pointcloud.PointCloud) (float64, bool) {
 // so all four edges are equivalent grasps, and the result is normalized to
 // (-90, 90] for the gripper's 180° symmetry. approachYaw is a fixed mounting
 // or tuning offset, and used alone as the fallback when the cloud is too
-// sparse or 4-fold-isotropic.
+// sparse or isotropic.
 func graspYawDegrees(pc pointcloud.PointCloud, approachYaw float64) float64 {
 	edge, ok := edgeYawDegrees(pc)
 	if !ok {
@@ -104,7 +116,8 @@ func graspYawDegrees(pc pointcloud.PointCloud, approachYaw float64) float64 {
 	return normalizeYaw(edge + approachYaw)
 }
 
-// normalizeYaw folds an angle into (-90, 90] to exploit a cube's 90° symmetry.
+// normalizeYaw folds an angle into (-90, 90] to exploit the gripper's 180°
+// symmetry (the wrist can spin either way and grasp identically).
 func normalizeYaw(deg float64) float64 {
 	for deg > 90 {
 		deg -= 180
