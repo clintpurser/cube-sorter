@@ -105,9 +105,10 @@ const (
 )
 
 // If a whole pick attempt fails after the inner retries, restart the cycle
-// from detection rather than discarding the block. Bounded so a persistent
-// obstacle still surfaces eventually.
-const cycleRestartLimit = 2
+// from detection rather than discarding the block. The arm keeps retrying
+// indefinitely — `stop` is the escape hatch if the obstruction is permanent.
+// A brief backoff between attempts avoids hammering the system when stuck.
+const cycleRestartBackoff = 2 * time.Second
 
 // armWorker owns one arm and runs its pick-and-place cycle on a dedicated
 // goroutine. Arm motion is planned on the gripper frame (so the frame system
@@ -256,13 +257,12 @@ func (w *armWorker) runSortPhase(ctx context.Context, dropHeld bool) bool {
 		case cycleEmpty, cycleDone:
 			return false
 		case cyclePickFailed:
-			if restart >= cycleRestartLimit {
-				w.logger.Warnf("[%s] pick failed %d times; giving up on this cycle", w.name, restart+1)
-				return false
-			}
-			w.logger.Infof("[%s] restarting cycle from detection (restart %d/%d)", w.name, restart+1, cycleRestartLimit)
+			w.logger.Warnf("[%s] pick failed (attempt %d); restarting from detection after %v", w.name, restart+1, cycleRestartBackoff)
 			// A partial pick may have left a block in the gripper; drop it.
 			dropHeld = true
+			if err := w.sleep(ctx, cycleRestartBackoff); err != nil {
+				return false
+			}
 		}
 	}
 }
