@@ -219,17 +219,11 @@ func (w *armWorker) runCycleAttempt(ctx context.Context, dropHeld bool) cycleOut
 		return cycleDone
 	}
 
-	// Nothing to pick — skip prepareZones (which would drive to inspect pose for
-	// senseZone) and leave the arm parked at start. placeInZone preps lazily on
-	// the first cycle that has detections.
+	// Nothing to pick — leave the arm parked at start. Each pickOne re-senses
+	// its target zone before lifting, so we don't need an upfront pass here.
 	if _, ok := w.nextLabel(); !ok {
-		w.logger.Infof("[%s] no owned objects detected; skipping zone preparation, staying at start", w.name)
+		w.logger.Infof("[%s] no owned objects detected; staying at start", w.name)
 		return cycleEmpty
-	}
-
-	if err := w.prepareZones(ctx); err != nil {
-		w.handleCycleErr("zone preparation", err)
-		return cycleDone
 	}
 
 	for {
@@ -347,6 +341,13 @@ func (w *armWorker) detectFromStart(ctx context.Context, dropHeld bool) error {
 }
 
 func (w *armWorker) pickOne(ctx context.Context, label string) error {
+	// Re-sense the zone before each placement so cell occupancy reflects
+	// reality (other arm placed here, prior place was off, manual change).
+	// Sense with an empty gripper, before lifting, so the held block doesn't
+	// occlude the camera.
+	if err := w.prepareZone(ctx, label); err != nil {
+		return err
+	}
 	if err := w.liftDetected(ctx, label); err != nil {
 		return err
 	}
@@ -520,9 +521,6 @@ func (w *armWorker) pickByLabel(label string) error {
 	}
 	if _, ok := w.lookupDetected(label); !ok {
 		return fmt.Errorf("object %q not detected", label)
-	}
-	if err := w.prepareZone(ctx, label); err != nil {
-		return err
 	}
 	if err := w.pickOne(ctx, label); err != nil {
 		return err
