@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -53,6 +54,19 @@ var pickConstraints = motionplan.Constraints{
 		},
 	},
 }
+
+// Motion planning sees a live snapshot of the frame system, so an IK failure
+// often just means the other arm happens to be parked in the way. Back off and
+// try again — by the next attempt the other worker has usually moved on.
+const (
+	moveRetryAttempts = 5
+	moveRetryBackoff  = 750 * time.Millisecond
+)
+
+// If a whole pick attempt fails after the inner retries, restart the cycle
+// from detection rather than discarding the block. Bounded so a persistent
+// obstacle still surfaces eventually.
+const cycleRestartLimit = 2
 
 // armWorker owns one arm and runs its pick-and-place cycle on a dedicated
 // goroutine. Arm motion is planned on the gripper frame (so the frame system
@@ -127,37 +141,66 @@ func (w *armWorker) runCycle(kind cmdKind) {
 	w.stopped.Store(false)
 
 	dropHeld := kind == cmdResume
+	for restart := 0; ; restart++ {
+		outcome := w.runCycleAttempt(ctx, dropHeld)
+		if outcome == cycleDone {
+			return
+		}
+		if outcome == cycleComplete {
+			break
+		}
+		// cyclePickFailed: a pick errored after the inner retries gave up.
+		// Re-detect and try again from a clean slate — by then the other arm
+		// has typically moved out of the way.
+		if restart >= cycleRestartLimit {
+			w.logger.Warnf("[%s] pick failed %d times; giving up on this cycle", w.name, restart+1)
+			break
+		}
+		w.logger.Infof("[%s] restarting cycle from detection (restart %d/%d)", w.name, restart+1, cycleRestartLimit)
+		// A partial pick may have left a block in the gripper; drop it.
+		dropHeld = true
+	}
+
+	w.setState(stateIdle)
+}
+
+type cycleOutcome int
+
+const (
+	cycleComplete   cycleOutcome = iota // all detected objects processed (success or per-label drop)
+	cycleDone                           // terminated (interrupt or unrecoverable error); caller should return
+	cyclePickFailed                     // pickOne failed; caller may restart from detection
+)
+
+func (w *armWorker) runCycleAttempt(ctx context.Context, dropHeld bool) cycleOutcome {
 	if err := w.detectFromStart(ctx, dropHeld); err != nil {
 		w.handleCycleErr("detection", err)
-		return
+		return cycleDone
 	}
 	if err := w.prepareZones(ctx); err != nil {
 		w.handleCycleErr("zone preparation", err)
-		return
+		return cycleDone
 	}
 
 	for {
 		if err := w.checkInterrupt(ctx); err != nil {
 			w.logger.Infof("[%s] cycle interrupted before next pick", w.name)
-			return
+			return cycleDone
 		}
 		label, ok := w.nextLabel()
 		if !ok {
-			break
+			return cycleComplete
 		}
 		if err := w.pickOne(ctx, label); err != nil {
 			if w.interrupted(ctx, err) {
 				w.logger.Infof("[%s] pick interrupted", w.name)
-				return
+				return cycleDone
 			}
-			// Non-fatal for the cycle (we drop this object and continue), but the
-			// operation the caller asked for did fail — log at Error.
 			w.logger.Errorf("[%s] failed to pick %q: %v", w.name, label, err)
+			return cyclePickFailed
 		}
 		w.removeDetected(label)
 	}
-
-	w.setState(stateIdle)
 }
 
 func (w *armWorker) handleCycleErr(phase string, err error) {
@@ -320,8 +363,29 @@ func (w *armWorker) pickOne(ctx context.Context, label string) error {
 }
 
 // moveGripper plans motion on the gripper frame, under motionMu so only one arm
-// moves at a time.
+// moves at a time. Planning-collision errors are retried with backoff: the
+// planner sees the live frame system, so an IK failure is usually just the
+// other arm parked in the way and clears once it moves on.
 func (w *armWorker) moveGripper(ctx context.Context, dest *referenceframe.PoseInFrame, constraints *motionplan.Constraints, extra map[string]any) error {
+	var err error
+	for attempt := 1; attempt <= moveRetryAttempts; attempt++ {
+		err = w.tryMoveGripper(ctx, dest, constraints, extra)
+		if err == nil {
+			return nil
+		}
+		if !isPlanCollisionErr(err) || attempt == moveRetryAttempts {
+			return err
+		}
+		w.logger.Infof("[%s] move blocked (attempt %d/%d), retrying in %v: %v",
+			w.name, attempt, moveRetryAttempts, moveRetryBackoff, err)
+		if sleepErr := w.sleep(ctx, moveRetryBackoff); sleepErr != nil {
+			return sleepErr
+		}
+	}
+	return err
+}
+
+func (w *armWorker) tryMoveGripper(ctx context.Context, dest *referenceframe.PoseInFrame, constraints *motionplan.Constraints, extra map[string]any) error {
 	if err := w.checkInterrupt(ctx); err != nil {
 		return err
 	}
@@ -337,6 +401,18 @@ func (w *armWorker) moveGripper(ctx context.Context, dest *referenceframe.PoseIn
 		Extra:         extra,
 	})
 	return err
+}
+
+// isPlanCollisionErr matches motion-plan failures caused by frame-system state
+// (a constraint violation or no valid IK solution) — the kind that typically
+// clears once the other arm finishes its current motion.
+func isPlanCollisionErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "IK solutions failed constraints") ||
+		strings.Contains(msg, "violation between")
 }
 
 // setSwitch drives the arm to a saved switch pose, under motionMu.
