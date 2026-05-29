@@ -36,6 +36,13 @@ type ArmUnit struct {
 
 	Zones []Zone `json:"zones"`
 
+	// ReturnArea defines the table region this arm uses to place blocks when
+	// returning them at the end of a sort cycle. Same shape as Zone (origin,
+	// width, depth, inspect_height), but no label — placements are random
+	// within the bounds. Must lie inside the camera's start-pose field of view,
+	// otherwise the next sort cycle won't detect the returned blocks.
+	ReturnArea Zone `json:"return_area"`
+
 	// CubeHeight is the nominal block height (mm); the grasp descends
 	// CubeHeight/2 below the visible top face to grab mid-block.
 	CubeHeight float64 `json:"cube_height,omitempty"`
@@ -109,6 +116,9 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 			if z.Width <= 0 || z.Depth <= 0 {
 				return nil, nil, fmt.Errorf("arm %d zone %q: width and depth must be positive", i, z.Label)
 			}
+		}
+		if u.ReturnArea.Width <= 0 || u.ReturnArea.Depth <= 0 {
+			return nil, nil, fmt.Errorf("arm %d (%s): return_area width and depth must be positive", i, u.Arm)
 		}
 	}
 	deps = append(deps, cfg.motionService())

@@ -130,6 +130,11 @@ func (s *sorter) buildWorker(deps resource.Dependencies, unit ArmUnit) (*armWork
 		}
 	}
 
+	returnArea := &returnAreaState{
+		cfg:   unit.ReturnArea,
+		pitch: pitch,
+	}
+
 	return &armWorker{
 		name:         unit.Arm,
 		logger:       s.logger,
@@ -139,6 +144,7 @@ func (s *sorter) buildWorker(deps resource.Dependencies, unit ArmUnit) (*armWork
 		segmenter:    segDep,
 		startPose:    startPose,
 		zones:        zones,
+		returnArea:   returnArea,
 		cubeHeight:   unit.CubeHeight,
 		graspZOffset: unit.GraspZOffset,
 		approachYaw:  unit.ApproachYaw,
@@ -148,6 +154,7 @@ func (s *sorter) buildWorker(deps resource.Dependencies, unit ArmUnit) (*armWork
 		parentCtx:    s.cancelCtx,
 		cmdCh:        make(chan cmdKind, 1),
 		state:        stateIdle,
+		phase:        phaseSorting,
 	}, nil
 }
 
@@ -231,6 +238,7 @@ func (s *sorter) aggregateStatus() map[string]any {
 	for _, w := range s.workers {
 		out[w.name] = map[string]any{
 			"status":           string(w.status()),
+			"phase":            string(w.currentPhase()),
 			"detected_objects": w.serializeDetected(),
 		}
 	}

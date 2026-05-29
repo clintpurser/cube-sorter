@@ -78,6 +78,7 @@ Configure an `arms` array — one entry per arm. The following attribute templat
 | `segmenter_name` | string | Required  | Name of the vision service providing point cloud objects + detections. |
 | `start_pose` | string | Required  | Name of the `arm-position-saver` switch component providing the start position. |
 | `zones` | array | Required  | One zone per color **this arm owns** (see below). An arm only picks labels with a matching zone. |
+| `return_area` | object | Required | Table region this arm uses to randomly place blocks during the return phase that runs after sorting completes. Same shape as a `zone` but without `label`. Must lie within the start-pose camera's field of view so the next sort cycle can detect the returned blocks. |
 | `cube_height` | number | Optional | Nominal block height (mm); the grasp descends `cube_height / 2` below the visible top to grab mid-block. Default `30`. |
 | `block_size` | number | Optional | Block footprint (mm) used for grid cell pitch. Default `cube_height`. |
 | `margin` | number | Optional | Gap (mm) added between grid cells. Default `0`. |
@@ -97,6 +98,21 @@ Configure an `arms` array — one entry per arm. The following attribute templat
 Blocks are grid-packed into the zone (cell pitch = `block_size + margin`). At the start of each cycle
 the arm hovers the camera `inspect_height` above each zone and marks occupied cells, so blocks of
 the same color don't pile onto each other and pre-existing blocks are avoided.
+
+#### Return area attributes (per-arm `return_area`)
+
+| Name          | Type   | Inclusion | Description                |
+|---------------|--------|-----------|----------------------------|
+| `origin` | `[x, y, z]` | Required | World-frame XYZ (mm) of the return area center. `z` is the gripper drop Z (same convention as a zone). Gripper points straight down when placing. |
+| `inspect_height` | number | Optional | Height (mm) above `origin` to position the gripper for sensing the area before each placement. Default `200`. |
+| `width` | number | Required | Return area extent along world X (mm). |
+| `depth` | number | Required | Return area extent along world Y (mm). |
+
+After every sort, each arm picks its delivered blocks back out of their zones and places them at
+randomized non-overlapping positions inside its `return_area`. The area is re-sensed before every
+placement so it reacts to whatever is actually there (blocks placed by the other arm, drift, or the
+user moving things). For the next sort cycle to detect the returned blocks, the area must be inside
+the camera's field of view at the start pose.
 
 #### Top-level attributes
 
@@ -120,7 +136,8 @@ the same color don't pile onto each other and pre-existing blocks are avoided.
       "zones": [
         {"label": "red_cube", "origin": [350, -120, 30], "width": 200, "depth": 150},
         {"label": "yellow_cube", "origin": [350, 120, 30], "width": 200, "depth": 150}
-      ]
+      ],
+      "return_area": {"origin": [0, -150, 30], "width": 250, "depth": 200}
     },
     {
       "arm_name": "right-arm",
@@ -133,7 +150,8 @@ the same color don't pile onto each other and pre-existing blocks are avoided.
       "zones": [
         {"label": "green_cube", "origin": [-350, -120, 30], "width": 200, "depth": 150},
         {"label": "blue_cube", "origin": [-350, 120, 30], "width": 200, "depth": 150}
-      ]
+      ],
+      "return_area": {"origin": [0, 150, 30], "width": 250, "depth": 200}
     }
   ]
 }
@@ -143,9 +161,15 @@ the same color don't pile onto each other and pre-existing blocks are avoided.
 
 #### Start
 
-Begin the sort routine on **every** arm in the background and return immediately. Each arm moves to
-its start pose, detects its owned colors, and sorts them. Arms move one at a time. Poll `get_status`
-to track progress.
+Begin a full cycle on **every** arm in the background and return immediately. A cycle has two phases:
+
+1. **`sorting`** — the arm moves to its start pose, detects owned colors, and places each block into
+   its color zone.
+2. **`returning`** — once sorting is done, the arm picks every delivered block back out of its zones
+   and places it at a randomized non-overlapping position in its `return_area`, then parks.
+
+Arms move one at a time. `start` while the worker is already in `returning` (e.g. after a mid-return
+`stop`) resumes the return phase instead of restarting sorting. Poll `get_status` to track progress.
 
 ```json
 {
@@ -181,9 +205,11 @@ Returns:
 
 #### Resume
 
-Clear the stopped state and continue: each arm returns to its start pose, opens its gripper (to drop
-any block it was holding when stopped), re-detects, and sorts whatever blocks remain. Robust to the
-arms/blocks having been moved during teleoperation.
+Clear the stopped state and continue at the phase the arm was in when stopped. If it was in the
+`sorting` phase, each arm returns to its start pose, opens its gripper (to drop any block it was
+holding when stopped), re-detects, and sorts whatever blocks remain. If it was in the `returning`
+phase, the arm parks at start, drops any held block, and resumes returning blocks from its zones to
+its return area. Robust to the arms/blocks having been moved during teleoperation.
 
 ```json
 {
@@ -201,9 +227,15 @@ Returns:
 
 #### Get Status
 
-Query per-arm status (`idle` -> `searching_for_objects` -> `objects_detected` -> `picking` ->
-`placing` -> `idle`, or `stopped` / `resetting`) and detected objects. Always returns promptly, even
+Query per-arm status, current cycle phase, and detected objects. Always returns promptly, even
 mid-pick.
+
+- `status` — fine-grained motion state: `idle` -> `searching_for_objects` -> `objects_detected` ->
+  `picking` -> `placing` -> `idle`, or `stopped` / `resetting`.
+- `phase` — which half of the cycle the worker will execute on the next `start` / `resume`:
+  `sorting` (default) or `returning`. The worker transitions to `returning` after a successful sort
+  and back to `sorting` after a successful return. Failures and `stop` leave the phase as-is, so a
+  subsequent `start` / `resume` retries the same phase. `reset` forces `sorting`.
 
 ```json
 {
@@ -218,6 +250,7 @@ Returns:
     "arms": {
         "<arm_name>": {
             "status": <string>,
+            "phase": <"sorting" | "returning">,
             "detected_objects": <{"label": <string>, "box": <{"xMin": <number>, "yMin": <number>, "xMax": <number>, "yMax": <number>}>}[]>
         }
     }
@@ -226,7 +259,8 @@ Returns:
 
 #### Reset
 
-Stop any current action, open the gripper, and return each arm to its start position.
+Stop any current action, open the gripper, return each arm to its start position, and reset the
+cycle phase to `sorting` so the next `start` begins a fresh sort.
 
 ```json
 {

@@ -46,6 +46,16 @@ const (
 	cmdResume
 )
 
+// cyclePhase tracks which half of the cube-sorter cycle the worker is in. A
+// cycle is sort-then-return; stopping mid-phase preserves the phase so the next
+// start/resume picks up where it left off rather than restarting from the top.
+type cyclePhase string
+
+const (
+	phaseSorting   cyclePhase = "sorting"
+	phaseReturning cyclePhase = "returning"
+)
+
 var pickConstraints = motionplan.Constraints{
 	LinearConstraint: []motionplan.LinearConstraint{
 		{
@@ -78,12 +88,13 @@ type armWorker struct {
 	logger logging.Logger
 
 	// deps
-	arm       arm.Arm
-	cam       camera.Camera
-	gripper   gripper.Gripper
-	segmenter vision.Service
-	startPose toggleswitch.Switch
-	zones     map[string]*zoneState
+	arm        arm.Arm
+	cam        camera.Camera
+	gripper    gripper.Gripper
+	segmenter  vision.Service
+	startPose  toggleswitch.Switch
+	zones      map[string]*zoneState
+	returnArea *returnAreaState
 
 	// geometry
 	cubeHeight   float64
@@ -107,6 +118,7 @@ type armWorker struct {
 	// in-memory state (short holds only)
 	mu       sync.RWMutex
 	state    armState
+	phase    cyclePhase
 	detected []DetectedObject
 }
 
@@ -136,32 +148,61 @@ func (w *armWorker) trigger(kind cmdKind) {
 	}
 }
 
+// runCycle dispatches one start/resume command to the right phase. Sort
+// completion transitions the worker to the returning phase and falls through;
+// if the worker was already in the returning phase (e.g. stopped mid-return,
+// then started again), it skips the sort and resumes returning. Failures in
+// either phase leave the phase unchanged so the next command retries the same
+// phase rather than starting over.
 func (w *armWorker) runCycle(kind cmdKind) {
 	ctx := w.newOpCtx()
 	w.stopped.Store(false)
-
 	dropHeld := kind == cmdResume
-	for restart := 0; ; restart++ {
-		outcome := w.runCycleAttempt(ctx, dropHeld)
-		if outcome == cycleDone {
+
+	switch w.currentPhase() {
+	case phaseSorting:
+		if !w.runSortPhase(ctx, dropHeld) {
+			w.setState(stateIdle)
 			return
 		}
-		if outcome == cycleComplete {
-			break
+		w.setPhase(phaseReturning)
+		// Sort already parked at start with the gripper empty; the return
+		// phase doesn't need to drop a held block.
+		dropHeld = false
+		fallthrough
+	case phaseReturning:
+		if err := w.returnBlocksToTable(ctx, dropHeld); err != nil {
+			w.handleCycleErr("return to table", err)
+			w.setState(stateIdle)
+			return
 		}
-		// cyclePickFailed: a pick errored after the inner retries gave up.
-		// Re-detect and try again from a clean slate — by then the other arm
-		// has typically moved out of the way.
-		if restart >= cycleRestartLimit {
-			w.logger.Warnf("[%s] pick failed %d times; giving up on this cycle", w.name, restart+1)
-			break
-		}
-		w.logger.Infof("[%s] restarting cycle from detection (restart %d/%d)", w.name, restart+1, cycleRestartLimit)
-		// A partial pick may have left a block in the gripper; drop it.
-		dropHeld = true
+		w.setPhase(phaseSorting)
+		w.setState(stateIdle)
 	}
+}
 
-	w.setState(stateIdle)
+// runSortPhase runs the sort loop and reports whether placements happened
+// (true → transition to returning, false → stay in sorting). False covers
+// three cases: nothing was detected, the cycle was interrupted, or pick failed
+// past the restart limit.
+func (w *armWorker) runSortPhase(ctx context.Context, dropHeld bool) bool {
+	for restart := 0; ; restart++ {
+		outcome := w.runCycleAttempt(ctx, dropHeld)
+		switch outcome {
+		case cycleComplete:
+			return true
+		case cycleEmpty, cycleDone:
+			return false
+		case cyclePickFailed:
+			if restart >= cycleRestartLimit {
+				w.logger.Warnf("[%s] pick failed %d times; giving up on this cycle", w.name, restart+1)
+				return false
+			}
+			w.logger.Infof("[%s] restarting cycle from detection (restart %d/%d)", w.name, restart+1, cycleRestartLimit)
+			// A partial pick may have left a block in the gripper; drop it.
+			dropHeld = true
+		}
+	}
 }
 
 type cycleOutcome int
@@ -170,6 +211,7 @@ const (
 	cycleComplete   cycleOutcome = iota // all detected objects processed (success or per-label drop)
 	cycleDone                           // terminated (interrupt or unrecoverable error); caller should return
 	cyclePickFailed                     // pickOne failed; caller may restart from detection
+	cycleEmpty                          // no owned objects detected at start; nothing to do
 )
 
 func (w *armWorker) runCycleAttempt(ctx context.Context, dropHeld bool) cycleOutcome {
@@ -183,7 +225,7 @@ func (w *armWorker) runCycleAttempt(ctx context.Context, dropHeld bool) cycleOut
 	// the first cycle that has detections.
 	if _, ok := w.nextLabel(); !ok {
 		w.logger.Infof("[%s] no owned objects detected; skipping zone preparation, staying at start", w.name)
-		return cycleComplete
+		return cycleEmpty
 	}
 
 	if err := w.prepareZones(ctx); err != nil {
@@ -294,6 +336,21 @@ func (w *armWorker) detectFromStart(ctx context.Context, dropHeld bool) error {
 }
 
 func (w *armWorker) pickOne(ctx context.Context, label string) error {
+	if err := w.liftDetected(ctx, label); err != nil {
+		return err
+	}
+	w.setState(statePlacing)
+	if err := w.placeInZone(ctx, label); err != nil {
+		return err
+	}
+	return w.setSwitch(ctx, w.startPose)
+}
+
+// liftDetected runs the pick path on the most recently detected object with
+// the given label: open gripper, approach, descend, grab, lift. The caller is
+// responsible for placing the held block (placeInZone for sort, placeOnTable
+// for return).
+func (w *armWorker) liftDetected(ctx context.Context, label string) error {
 	obj, ok := w.lookupDetected(label)
 	if !ok {
 		return fmt.Errorf("no detected object with label %q", label)
@@ -357,18 +414,7 @@ func (w *armWorker) pickOne(ctx context.Context, label string) error {
 	liftPoint := pickPoint
 	liftPoint.Z += liftHeightMm
 	liftPose := referenceframe.NewPoseInFrame("world", spatialmath.NewPose(liftPoint, &orient))
-	if err := w.moveGripper(ctx, liftPose, nil, nil); err != nil {
-		return err
-	}
-
-	// Place into the next free cell of the color's zone.
-	w.setState(statePlacing)
-	if err := w.placeInZone(ctx, label); err != nil {
-		return err
-	}
-
-	// Return home.
-	return w.setSwitch(ctx, w.startPose)
+	return w.moveGripper(ctx, liftPose, nil, nil)
 }
 
 // moveGripper plans motion on the gripper frame, under motionMu so only one arm
@@ -520,6 +566,7 @@ func (w *armWorker) reset() error {
 
 	w.mu.Lock()
 	w.state = stateIdle
+	w.phase = phaseSorting
 	w.detected = nil
 	w.mu.Unlock()
 
@@ -586,6 +633,19 @@ func (w *armWorker) status() armState {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	return w.state
+}
+
+func (w *armWorker) currentPhase() cyclePhase {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.phase
+}
+
+func (w *armWorker) setPhase(p cyclePhase) {
+	w.mu.Lock()
+	w.phase = p
+	w.mu.Unlock()
+	w.logger.Infof("[%s] phase -> %s", w.name, p)
 }
 
 func (w *armWorker) ownsLabel(label string) bool {
