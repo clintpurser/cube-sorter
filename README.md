@@ -48,6 +48,7 @@ Configure an `arms` array — one entry per arm. The following attribute templat
           "label": <string>,
           "origin": [<number>, <number>, <number>],
           "inspect_height": <number>,
+          "inspect_x_offset": <number>,
           "width": <number>,
           "depth": <number>
         }
@@ -92,6 +93,7 @@ Configure an `arms` array — one entry per arm. The following attribute templat
 | `label` | string | Required | Detection label (color) this zone receives. |
 | `origin` | `[x, y, z]` | Required | World-frame XYZ (mm) of the zone center; used as the grid origin and the drop point. Gripper points straight down (`OZ: -1`) when placing. |
 | `inspect_height` | number | Optional | Height (mm) above `origin` to position the gripper for occupancy sensing. Default `200`. |
+| `inspect_x_offset` | number | Optional | Shift (mm) applied to the gripper's commanded X at the inspect pose, relative to `origin`. Used to compensate for the camera's mount offset so the camera's view covers the whole zone instead of cropping the near edge. Default `-100`. |
 | `width` | number | Required | Zone extent along world X (mm). |
 | `depth` | number | Required | Zone extent along world Y (mm). |
 
@@ -105,6 +107,7 @@ the same color don't pile onto each other and pre-existing blocks are avoided.
 |---------------|--------|-----------|----------------------------|
 | `origin` | `[x, y, z]` | Required | World-frame XYZ (mm) of the return area center. `z` is the gripper drop Z (same convention as a zone). Gripper points straight down when placing. |
 | `inspect_height` | number | Optional | Height (mm) above `origin` to position the gripper for sensing the area before each placement. Default `200`. |
+| `inspect_x_offset` | number | Optional | Shift (mm) applied to the gripper's commanded X at the inspect pose, relative to `origin`. Same purpose and default (`-100`) as on a zone. |
 | `width` | number | Required | Return area extent along world X (mm). |
 | `depth` | number | Required | Return area extent along world Y (mm). |
 

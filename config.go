@@ -42,9 +42,10 @@ type ArmUnit struct {
 
 	// ReturnArea defines the table region this arm uses to place blocks when
 	// returning them at the end of a sort cycle. Same shape as Zone (origin,
-	// width, depth, inspect_height), but no label — placements are random
-	// within the bounds. Must lie inside the camera's start-pose field of view,
-	// otherwise the next sort cycle won't detect the returned blocks.
+	// width, depth, inspect_height, inspect_x_offset), but no label —
+	// placements are random within the bounds. Must lie inside the camera's
+	// start-pose field of view, otherwise the next sort cycle won't detect
+	// the returned blocks.
 	ReturnArea Zone `json:"return_area"`
 
 	// CubeHeight is the nominal block height (mm); the grasp descends
@@ -76,7 +77,7 @@ const defaultInspectHeightMm = 200.0
 
 // defaultInspectXOffsetMm shifts the inspect pose back along world X so the
 // camera's FOV covers the whole zone instead of cropping the near edge.
-const defaultInspectXOffsetMm = -50.0
+const defaultInspectXOffsetMm = -100.0
 
 // units returns the arm units with per-unit defaults applied. Viam decodes
 // attributes via mapstructure (json tag names), so defaulting happens here.
