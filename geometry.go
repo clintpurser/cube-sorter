@@ -91,17 +91,17 @@ func edgeYawDegrees(pc pointcloud.PointCloud) (float64, bool) {
 }
 
 // graspYawDegrees returns the gripper yaw (degrees) for a two-finger grasp:
-// the fingers close perpendicular to the block's dominant edge. A cube is
-// 4-fold-symmetric so the four edges are equivalent grasps; the result is
-// normalized to (-90, 90] for the gripper's 180° symmetry. approachYaw is a
-// fixed mounting/tuning offset, and used alone as the fallback when the cloud
-// is too sparse or 4-fold-isotropic.
+// align the wrist with one of the cube's edges. The cube is 4-fold-symmetric
+// so all four edges are equivalent grasps, and the result is normalized to
+// (-90, 90] for the gripper's 180° symmetry. approachYaw is a fixed mounting
+// or tuning offset, and used alone as the fallback when the cloud is too
+// sparse or 4-fold-isotropic.
 func graspYawDegrees(pc pointcloud.PointCloud, approachYaw float64) float64 {
 	edge, ok := edgeYawDegrees(pc)
 	if !ok {
 		return normalizeYaw(approachYaw)
 	}
-	return normalizeYaw(edge + 90 + approachYaw)
+	return normalizeYaw(edge + approachYaw + 45)
 }
 
 // normalizeYaw folds an angle into (-90, 90] to exploit a cube's 90° symmetry.
