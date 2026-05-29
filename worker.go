@@ -35,13 +35,14 @@ var errGripperEmpty = errors.New("gripper reported no object grabbed")
 type armState string
 
 const (
-	stateIdle      armState = "idle"
-	stateSearching armState = "searching_for_objects"
-	stateDetected  armState = "objects_detected"
-	statePicking   armState = "picking"
-	statePlacing   armState = "placing"
-	stateStopped   armState = "stopped"
-	stateResetting armState = "resetting"
+	stateIdle              armState = "idle"
+	stateSearching         armState = "searching_for_objects"
+	stateDetected          armState = "objects_detected"
+	statePicking           armState = "picking"
+	statePlacing           armState = "placing"
+	stateWaitingForPartner armState = "waiting_for_partner"
+	stateStopped           armState = "stopped"
+	stateResetting         armState = "resetting"
 )
 
 // cyclePhase tracks which half of the cube-sorter cycle the worker is in. A
@@ -53,6 +54,38 @@ const (
 	phaseSorting   cyclePhase = "sorting"
 	phaseReturning cyclePhase = "returning"
 )
+
+// cycleBarrier keeps the arms in lockstep at the sort→return boundary. The
+// sorter builds a fresh barrier on every `start` and pushes the same pointer
+// onto each worker's cmdCh, so all participants in one cycle share it.
+//
+// Every runCycle invocation calls arrive() exactly once. arrive() decrements a
+// pending count and returns a channel that closes when the count hits zero. A
+// worker about to enter the return phase blocks on that channel; a worker
+// bailing out (sort empty, pick failed, interrupted) still calls arrive() so
+// the count completes and any waiter unblocks instead of hanging.
+type cycleBarrier struct {
+	mu      sync.Mutex
+	pending int
+	ready   chan struct{}
+}
+
+func newCycleBarrier(participants int) *cycleBarrier {
+	return &cycleBarrier{
+		pending: participants,
+		ready:   make(chan struct{}),
+	}
+}
+
+func (b *cycleBarrier) arrive() <-chan struct{} {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.pending--
+	if b.pending == 0 {
+		close(b.ready)
+	}
+	return b.ready
+}
 
 var pickConstraints = motionplan.Constraints{
 	LinearConstraint: []motionplan.LinearConstraint{
@@ -106,7 +139,7 @@ type armWorker struct {
 
 	// lifecycle
 	parentCtx context.Context
-	cmdCh     chan struct{}
+	cmdCh     chan *cycleBarrier
 
 	// interrupt control
 	stopped  atomic.Bool
@@ -131,36 +164,41 @@ func (w *armWorker) run(wg *sync.WaitGroup) {
 		select {
 		case <-w.parentCtx.Done():
 			return
-		case <-w.cmdCh:
-			w.runCycle()
+		case b := <-w.cmdCh:
+			w.runCycle(b)
 		}
 	}
 }
 
-// trigger requests a new cycle without blocking; duplicate requests while a
-// cycle is already running are dropped.
-func (w *armWorker) trigger() {
+// triggerWith requests a new cycle without blocking, handing the worker the
+// barrier that synchronizes it with its partner at the sort→return boundary.
+// Duplicate requests while a cycle is already running are dropped — the
+// already-queued barrier takes effect for the next cycle.
+func (w *armWorker) triggerWith(barrier *cycleBarrier) {
 	select {
-	case w.cmdCh <- struct{}{}:
+	case w.cmdCh <- barrier:
 	default:
 	}
 }
 
 // runCycle dispatches one start command to the right phase. Sort completion
-// transitions the worker to the returning phase and falls through; if the
-// worker was already in the returning phase (e.g. stopped mid-return, then
-// started again), it skips the sort and resumes returning. Failures in either
-// phase leave the phase unchanged so the next command retries the same phase
-// rather than starting over. The gripper is always opened at the start pose so
-// any block held over from a prior stop falls onto the table.
-func (w *armWorker) runCycle() {
+// transitions the worker to the returning phase; if the worker was already in
+// the returning phase (e.g. stopped mid-return, then started again), it skips
+// the sort. Both code paths then wait at the shared barrier so both arms
+// enter the return phase together. Failures in either phase leave the phase
+// unchanged so the next command retries the same phase rather than starting
+// over. The gripper is opened at the start pose so any block held over from a
+// prior stop falls onto the table.
+func (w *armWorker) runCycle(barrier *cycleBarrier) {
 	ctx := w.newOpCtx()
 	w.stopped.Store(false)
 	dropHeld := true
 
-	switch w.currentPhase() {
-	case phaseSorting:
+	if w.currentPhase() == phaseSorting {
 		if !w.runSortPhase(ctx, dropHeld) {
+			// Not entering return; release the barrier so the partner arm
+			// doesn't wait for us.
+			barrier.arrive()
 			w.setState(stateIdle)
 			return
 		}
@@ -168,15 +206,40 @@ func (w *armWorker) runCycle() {
 		// Sort already parked at start with the gripper empty; the return
 		// phase doesn't need to drop a held block.
 		dropHeld = false
-		fallthrough
-	case phaseReturning:
-		if err := w.returnBlocksToTable(ctx, dropHeld); err != nil {
-			w.handleCycleErr("return to table", err)
-			w.setState(stateIdle)
-			return
-		}
-		w.setPhase(phaseSorting)
+	}
+
+	if err := w.waitForPartner(ctx, barrier); err != nil {
+		w.handleCycleErr("sort→return sync", err)
 		w.setState(stateIdle)
+		return
+	}
+
+	if err := w.returnBlocksToTable(ctx, dropHeld); err != nil {
+		w.handleCycleErr("return to table", err)
+		w.setState(stateIdle)
+		return
+	}
+	w.setPhase(phaseSorting)
+	w.setState(stateIdle)
+}
+
+// waitForPartner signals arrival at the sort→return barrier and blocks until
+// the partner arm also arrives (or signals it isn't returning). Honors
+// ctx/stop so a stop request unblocks the wait.
+func (w *armWorker) waitForPartner(ctx context.Context, barrier *cycleBarrier) error {
+	ready := barrier.arrive()
+	select {
+	case <-ready:
+		return w.checkInterrupt(ctx)
+	default:
+	}
+	w.logger.Infof("[%s] sort complete; waiting for partner arm", w.name)
+	w.setState(stateWaitingForPartner)
+	select {
+	case <-ready:
+		return w.checkInterrupt(ctx)
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

@@ -152,7 +152,7 @@ func (s *sorter) buildWorker(deps resource.Dependencies, unit ArmUnit) (*armWork
 		client:       s.client,
 		motionMu:     &s.motionMu,
 		parentCtx:    s.cancelCtx,
-		cmdCh:        make(chan struct{}, 1),
+		cmdCh:        make(chan *cycleBarrier, 1),
 		state:        stateIdle,
 		phase:        phaseSorting,
 	}, nil
@@ -166,8 +166,9 @@ func (s *sorter) DoCommand(ctx context.Context, cmd map[string]interface{}) (map
 	switch cmd["command"] {
 	case "start":
 		s.logger.Infof("start sorting called on %d arm(s)", len(s.workers))
+		barrier := newCycleBarrier(len(s.workers))
 		for _, w := range s.workers {
-			w.trigger()
+			w.triggerWith(barrier)
 		}
 		return map[string]any{"success": true, "status": "started"}, nil
 

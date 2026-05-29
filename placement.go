@@ -78,18 +78,9 @@ func abs(v float64) float64 {
 	return v
 }
 
-// prepareZones (re)senses every owned zone while the arm is empty: it builds
-// the grid (on first use) and hovers the camera above each zone to mark
-// occupied cells. Safe to call at the start of every cycle.
-func (w *armWorker) prepareZones(ctx context.Context) error {
-	for label := range w.zones {
-		if err := w.prepareZone(ctx, label); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
+// prepareZone (re)senses one zone while the arm is empty: it builds the grid
+// (on first use) and hovers the camera above the zone to mark occupied cells.
+// Called before each pick so the placement uses fresh occupancy.
 func (w *armWorker) prepareZone(ctx context.Context, label string) error {
 	z, ok := w.zones[label]
 	if !ok {
