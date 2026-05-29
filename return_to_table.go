@@ -43,8 +43,8 @@ func (r *returnAreaState) ensureOrigin() {
 
 // returnBlocksToTable picks every owned block out of its delivery zone and
 // places it at a random non-overlapping position in the return area, then
-// parks at start. If dropHeld is true (resume after stop), the gripper is
-// opened at start pose first so any held block lands on the table where the
+// parks at start. If dropHeld is true, the gripper is opened at start pose
+// first so any block held over from a prior stop lands on the table where the
 // next sort cycle will pick it up.
 func (w *armWorker) returnBlocksToTable(ctx context.Context, dropHeld bool) error {
 	w.returnArea.ensureOrigin()
@@ -54,7 +54,7 @@ func (w *armWorker) returnBlocksToTable(ctx context.Context, dropHeld bool) erro
 		if err := w.setSwitch(ctx, w.startPose); err != nil {
 			return err
 		}
-		w.logger.Infof("[%s] return resume: dropping held block at start", w.name)
+		w.logger.Infof("[%s] return: dropping any held block at start", w.name)
 		if err := w.gripper.Open(ctx, nil); err != nil {
 			return err
 		}

@@ -39,16 +39,9 @@ const (
 	stateResetting armState = "resetting"
 )
 
-type cmdKind int
-
-const (
-	cmdStart cmdKind = iota
-	cmdResume
-)
-
 // cyclePhase tracks which half of the cube-sorter cycle the worker is in. A
-// cycle is sort-then-return; stopping mid-phase preserves the phase so the next
-// start/resume picks up where it left off rather than restarting from the top.
+// cycle is sort-then-return. Phase persists across stop so the next start
+// resumes the phase that was interrupted; a clean finish resets to sorting.
 type cyclePhase string
 
 const (
@@ -108,7 +101,7 @@ type armWorker struct {
 
 	// lifecycle
 	parentCtx context.Context
-	cmdCh     chan cmdKind
+	cmdCh     chan struct{}
 
 	// interrupt control
 	stopped  atomic.Bool
@@ -126,38 +119,39 @@ func (w *armWorker) gripperName() string {
 	return w.gripper.Name().ShortName()
 }
 
-// run is the worker's event loop; one cycle per start/resume command.
+// run is the worker's event loop; one cycle per start command.
 func (w *armWorker) run(wg *sync.WaitGroup) {
 	defer wg.Done()
 	for {
 		select {
 		case <-w.parentCtx.Done():
 			return
-		case kind := <-w.cmdCh:
-			w.runCycle(kind)
+		case <-w.cmdCh:
+			w.runCycle()
 		}
 	}
 }
 
 // trigger requests a new cycle without blocking; duplicate requests while a
 // cycle is already running are dropped.
-func (w *armWorker) trigger(kind cmdKind) {
+func (w *armWorker) trigger() {
 	select {
-	case w.cmdCh <- kind:
+	case w.cmdCh <- struct{}{}:
 	default:
 	}
 }
 
-// runCycle dispatches one start/resume command to the right phase. Sort
-// completion transitions the worker to the returning phase and falls through;
-// if the worker was already in the returning phase (e.g. stopped mid-return,
-// then started again), it skips the sort and resumes returning. Failures in
-// either phase leave the phase unchanged so the next command retries the same
-// phase rather than starting over.
-func (w *armWorker) runCycle(kind cmdKind) {
+// runCycle dispatches one start command to the right phase. Sort completion
+// transitions the worker to the returning phase and falls through; if the
+// worker was already in the returning phase (e.g. stopped mid-return, then
+// started again), it skips the sort and resumes returning. Failures in either
+// phase leave the phase unchanged so the next command retries the same phase
+// rather than starting over. The gripper is always opened at the start pose so
+// any block held over from a prior stop falls onto the table.
+func (w *armWorker) runCycle() {
 	ctx := w.newOpCtx()
 	w.stopped.Store(false)
-	dropHeld := kind == cmdResume
+	dropHeld := true
 
 	switch w.currentPhase() {
 	case phaseSorting:
@@ -521,7 +515,7 @@ func (w *armWorker) pickByLabel(label string) error {
 }
 
 // stop cancels in-flight motion, halts the arm, and flips the silence flag so
-// no further commands are issued until resume.
+// no further commands are issued until the next start.
 func (w *armWorker) stop() error {
 	w.stopped.Store(true)
 	w.cancelOp()
@@ -531,12 +525,6 @@ func (w *armWorker) stop() error {
 	defer cancel()
 	w.logger.Infof("[%s] stopping arm", w.name)
 	return w.arm.Stop(ctx, nil)
-}
-
-// resume clears the silence flag and re-runs detect-and-continue.
-func (w *armWorker) resume() {
-	w.stopped.Store(false)
-	w.trigger(cmdResume)
 }
 
 // reset stops the arm, opens the gripper, returns to start, and clears state.
