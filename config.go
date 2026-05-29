@@ -12,13 +12,27 @@ import (
 type Zone struct {
 	// Label is the detection label (color) this zone receives.
 	Label string `json:"label"`
+	// Origin is the world-frame XYZ (mm) of the zone center. When set, the
+	// anchor visit is skipped and the gripper place orientation defaults to
+	// straight down. Provide this when driving into the anchor pose is unsafe
+	// (e.g. blocks may already be sitting at the grid corner). When Origin is
+	// set, InspectPose may be omitted — the inspect pose is then derived as
+	// InspectHeight directly above Origin with the gripper pointing down.
+	Origin *[3]float64 `json:"origin,omitempty"`
+	// InspectHeight is how far above Origin (mm) to position the gripper for
+	// occupancy sensing. Only used when Origin is set and InspectPose is empty.
+	// Defaults to defaultInspectHeightMm.
+	InspectHeight float64 `json:"inspect_height,omitempty"`
 	// AnchorPose is an arm-position-saver switch whose resulting gripper world
 	// pose is the center of the zone (and the drop height/orientation). Its
-	// world pose is captured once by driving to it and reading GetPose.
-	AnchorPose string `json:"anchor_pose"`
+	// world pose is captured once by driving to it and reading GetPose. Required
+	// only when Origin is not set.
+	AnchorPose string `json:"anchor_pose,omitempty"`
 	// InspectPose is an arm-position-saver switch that puts the (eye-in-hand)
 	// camera where it can see the zone, so occupied cells can be detected.
-	InspectPose string `json:"inspect_pose"`
+	// Required only when Origin is not set; otherwise the inspect pose is
+	// derived from Origin + InspectHeight.
+	InspectPose string `json:"inspect_pose,omitempty"`
 	// Width (along world X) and Depth (along world Y) of the zone, in mm.
 	Width float64 `json:"width"`
 	Depth float64 `json:"depth"`
@@ -58,6 +72,10 @@ type Config struct {
 }
 
 const defaultCubeHeight = 30.0
+
+// defaultInspectHeightMm is how far above the zone origin the gripper is sent
+// for occupancy sensing when InspectHeight is left unset.
+const defaultInspectHeightMm = 200.0
 
 // units returns the arm units with per-unit defaults applied. Viam decodes
 // attributes via mapstructure (json tag names), so defaulting happens here.
@@ -99,13 +117,24 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 		}
 		deps = append(deps, u.Arm, u.Cam, u.Gripper, u.Segmenter, u.StartPose)
 		for j, z := range u.Zones {
-			if z.Label == "" || z.AnchorPose == "" || z.InspectPose == "" {
-				return nil, nil, fmt.Errorf("arm %d zone %d: label, anchor_pose and inspect_pose are required", i, j)
+			if z.Label == "" {
+				return nil, nil, fmt.Errorf("arm %d zone %d: label is required", i, j)
+			}
+			if z.AnchorPose == "" && z.Origin == nil {
+				return nil, nil, fmt.Errorf("arm %d zone %q: either anchor_pose or origin must be set", i, z.Label)
+			}
+			if z.InspectPose == "" && z.Origin == nil {
+				return nil, nil, fmt.Errorf("arm %d zone %q: inspect_pose is required unless origin is set", i, z.Label)
 			}
 			if z.Width <= 0 || z.Depth <= 0 {
 				return nil, nil, fmt.Errorf("arm %d zone %q: width and depth must be positive", i, z.Label)
 			}
-			deps = append(deps, z.AnchorPose, z.InspectPose)
+			if z.AnchorPose != "" {
+				deps = append(deps, z.AnchorPose)
+			}
+			if z.InspectPose != "" {
+				deps = append(deps, z.InspectPose)
+			}
 		}
 	}
 	deps = append(deps, cfg.motionService())

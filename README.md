@@ -46,6 +46,8 @@ Configure an `arms` array — one entry per arm. The following attribute templat
       "zones": [
         {
           "label": <string>,
+          "origin": [<number>, <number>, <number>],
+          "inspect_height": <number>,
           "anchor_pose": <string>,
           "inspect_pose": <string>,
           "width": <number>,
@@ -89,14 +91,20 @@ Configure an `arms` array — one entry per arm. The following attribute templat
 | Name          | Type   | Inclusion | Description                |
 |---------------|--------|-----------|----------------------------|
 | `label` | string | Required | Detection label (color) this zone receives. |
-| `anchor_pose` | string | Required | `arm-position-saver` switch whose resulting gripper world pose is the **center** of the zone (and the drop height/orientation). Captured once by driving to it. |
-| `inspect_pose` | string | Required | `arm-position-saver` switch that points the (eye-in-hand) camera at the zone so occupied cells can be detected before placing. |
+| `origin` | `[x, y, z]` | Optional† | World-frame XYZ (mm) of the zone center. When set, the **anchor visit is skipped** (use this when driving into the anchor pose risks colliding with placed blocks) and the place orientation defaults to straight down. |
+| `inspect_height` | number | Optional | Height (mm) above `origin` to send the gripper for occupancy sensing. Only used when `origin` is set and `inspect_pose` is omitted. Default `200`. |
+| `anchor_pose` | string | Optional† | `arm-position-saver` switch whose resulting gripper world pose is the **center** of the zone (and the drop height/orientation). Captured once by driving to it. |
+| `inspect_pose` | string | Optional† | `arm-position-saver` switch that points the (eye-in-hand) camera at the zone so occupied cells can be detected before placing. |
 | `width` | number | Required | Zone extent along world X (mm). |
 | `depth` | number | Required | Zone extent along world Y (mm). |
 
+† Either `anchor_pose` or `origin` must be set. Either `inspect_pose` or `origin` must be set
+(when `origin` is set, the inspect pose is derived as `inspect_height` above origin with the
+gripper pointing straight down).
+
 Blocks are grid-packed into the zone (cell pitch = `block_size + margin`). At the start of each cycle
-the arm visits each `inspect_pose` and marks occupied cells, so blocks of the same color don't pile
-onto each other and pre-existing blocks are avoided.
+the arm visits each zone's inspect pose and marks occupied cells, so blocks of the same color don't
+pile onto each other and pre-existing blocks are avoided.
 
 #### Top-level attributes
 

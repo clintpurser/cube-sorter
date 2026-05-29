@@ -100,16 +100,23 @@ func (w *armWorker) prepareZone(ctx context.Context, label string) error {
 	}
 
 	if z.origin == nil {
-		if err := w.setSwitch(ctx, z.anchor); err != nil {
-			return err
+		if z.cfg.Origin != nil {
+			pt := r3.Vector{X: z.cfg.Origin[0], Y: z.cfg.Origin[1], Z: z.cfg.Origin[2]}
+			z.origin = spatialmath.NewPose(pt, &spatialmath.OrientationVectorDegrees{OZ: -1})
+			z.buildCells()
+			w.logger.Infof("[%s] zone %q origin from config at %v with %d cells", w.name, label, pt, len(z.cells))
+		} else {
+			if err := w.setSwitch(ctx, z.anchor); err != nil {
+				return err
+			}
+			pose, err := w.motion.GetPose(ctx, w.gripperName(), "world", nil, nil)
+			if err != nil {
+				return err
+			}
+			z.origin = pose.Pose()
+			z.buildCells()
+			w.logger.Infof("[%s] zone %q anchored at %v with %d cells", w.name, label, z.origin.Point(), len(z.cells))
 		}
-		pose, err := w.motion.GetPose(ctx, w.gripperName(), "world", nil, nil)
-		if err != nil {
-			return err
-		}
-		z.origin = pose.Pose()
-		z.buildCells()
-		w.logger.Infof("[%s] zone %q anchored at %v with %d cells", w.name, label, z.origin.Point(), len(z.cells))
 	}
 
 	return w.senseZone(ctx, z)
@@ -118,8 +125,22 @@ func (w *armWorker) prepareZone(ctx context.Context, label string) error {
 // senseZone drives to the inspect pose and marks cells occupied by detected
 // blocks. Must be called with an empty gripper so the camera isn't occluded.
 func (w *armWorker) senseZone(ctx context.Context, z *zoneState) error {
-	if err := w.setSwitch(ctx, z.inspect); err != nil {
-		return err
+	if z.inspect != nil {
+		if err := w.setSwitch(ctx, z.inspect); err != nil {
+			return err
+		}
+	} else {
+		origin := z.origin.Point()
+		height := z.cfg.InspectHeight
+		if height == 0 {
+			height = defaultInspectHeightMm
+		}
+		inspectPt := r3.Vector{X: origin.X, Y: origin.Y, Z: origin.Z + height}
+		inspectPose := referenceframe.NewPoseInFrame("world",
+			spatialmath.NewPose(inspectPt, &spatialmath.OrientationVectorDegrees{OZ: -1}))
+		if err := w.moveGripper(ctx, inspectPose, nil, nil); err != nil {
+			return err
+		}
 	}
 	if err := w.sleep(ctx, 500*time.Millisecond); err != nil { // settle
 		return err
