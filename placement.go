@@ -173,25 +173,33 @@ func (w *armWorker) placeInZone(ctx context.Context, label string) error {
 	above := cell.pt
 	above.Z += approachHeightMm
 
-	w.logger.Infof("[%s] placing %q at cell %v", w.name, label, cell.pt)
+	w.logger.Infof("[%s] placing %q at cell %v (drop Z=%.1f, approach Z=%.1f, orient=%v)",
+		w.name, label, cell.pt, cell.pt.Z, above.Z, orient)
 
 	abovePose := referenceframe.NewPoseInFrame("world", spatialmath.NewPose(above, orient))
 	dropPose := referenceframe.NewPoseInFrame("world", spatialmath.NewPose(cell.pt, orient))
 
 	if err := w.moveGripper(ctx, abovePose, nil, nil); err != nil {
-		return err
+		w.logger.Errorf("[%s] place %q: move to approach pose %v failed: %v", w.name, label, above, err)
+		return fmt.Errorf("place %q approach %v: %w", label, above, err)
 	}
 	if err := w.moveGripper(ctx, dropPose, &pickConstraints, nil); err != nil {
-		return err
+		w.logger.Errorf("[%s] place %q: descent to drop pose %v failed: %v "+
+			"(check origin.Z — it must be the gripper frame Z at drop, ~cube_height/2 above the surface, "+
+			"not the surface itself; cube_height=%.1f)",
+			w.name, label, cell.pt, err, w.cubeHeight)
+		return fmt.Errorf("place %q descent %v: %w", label, cell.pt, err)
 	}
 	if err := w.gripper.Open(ctx, nil); err != nil {
-		return err
+		w.logger.Errorf("[%s] place %q: gripper open at %v failed: %v", w.name, label, cell.pt, err)
+		return fmt.Errorf("place %q open: %w", label, err)
 	}
 	if err := w.sleep(ctx, 250*time.Millisecond); err != nil {
 		return err
 	}
 	if err := w.moveGripper(ctx, abovePose, nil, nil); err != nil {
-		return err
+		w.logger.Errorf("[%s] place %q: retreat to approach pose %v failed: %v", w.name, label, above, err)
+		return fmt.Errorf("place %q retreat %v: %w", label, above, err)
 	}
 
 	cell.occupied = true
