@@ -158,7 +158,11 @@ func (w *armWorker) gripperName() string {
 	return w.gripper.Name().ShortName()
 }
 
-// run is the worker's event loop; one cycle per start command.
+// run is the worker's event loop. A start command kicks off one runCycle,
+// after which the worker self-loops with a fresh single-participant barrier
+// for as long as cycles keep completing cleanly (full sort→return, no
+// interrupt). Any other outcome — nothing to sort, interrupt, return failure
+// — drops back to waiting on cmdCh for the next external start.
 func (w *armWorker) run(wg *sync.WaitGroup) {
 	defer wg.Done()
 	for {
@@ -166,7 +170,13 @@ func (w *armWorker) run(wg *sync.WaitGroup) {
 		case <-w.parentCtx.Done():
 			return
 		case b := <-w.cmdCh:
-			w.runCycle(b)
+			for completed := w.runCycle(b); completed && !w.stopped.Load(); completed = w.runCycle(newCycleBarrier(1)) {
+				select {
+				case <-w.parentCtx.Done():
+					return
+				default:
+				}
+			}
 		}
 	}
 }
@@ -189,8 +199,9 @@ func (w *armWorker) triggerWith(barrier *cycleBarrier) {
 // enter the return phase together. Failures in either phase leave the phase
 // unchanged so the next command retries the same phase rather than starting
 // over. The gripper is opened at the start pose so any block held over from a
-// prior stop falls onto the table.
-func (w *armWorker) runCycle(barrier *cycleBarrier) {
+// prior stop falls onto the table. Returns true only when a full sort→return
+// cycle finishes cleanly — the signal `run` uses to auto-loop the next cycle.
+func (w *armWorker) runCycle(barrier *cycleBarrier) bool {
 	ctx := w.newOpCtx()
 	w.stopped.Store(false)
 	dropHeld := true
@@ -201,7 +212,7 @@ func (w *armWorker) runCycle(barrier *cycleBarrier) {
 			// doesn't wait for us.
 			barrier.arrive()
 			w.setState(stateIdle)
-			return
+			return false
 		}
 		w.setPhase(phaseReturning)
 		// Sort already parked at start with the gripper empty; the return
@@ -212,16 +223,17 @@ func (w *armWorker) runCycle(barrier *cycleBarrier) {
 	if err := w.waitForPartner(ctx, barrier); err != nil {
 		w.handleCycleErr("sort→return sync", err)
 		w.setState(stateIdle)
-		return
+		return false
 	}
 
 	if err := w.returnBlocksToTable(ctx, dropHeld); err != nil {
 		w.handleCycleErr("return to table", err)
 		w.setState(stateIdle)
-		return
+		return false
 	}
 	w.setPhase(phaseSorting)
 	w.setState(stateIdle)
+	return true
 }
 
 // waitForPartner signals arrival at the sort→return barrier and blocks until
