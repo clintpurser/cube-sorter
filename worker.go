@@ -27,6 +27,11 @@ import (
 // errStopped is returned by an in-progress operation when stop() is called.
 var errStopped = errors.New("operation stopped")
 
+// errGripperEmpty is returned by liftDetected when Grab reports no object was
+// captured. The cycle loop treats this as a pick failure and restarts from
+// detection so the arm returns to the inspect pose and tries again.
+var errGripperEmpty = errors.New("gripper reported no object grabbed")
+
 type armState string
 
 const (
@@ -244,7 +249,19 @@ func (w *armWorker) runCycleAttempt(ctx context.Context, dropHeld bool) cycleOut
 			w.logger.Errorf("[%s] failed to pick %q: %v", w.name, label, err)
 			return cyclePickFailed
 		}
-		w.removeDetected(label)
+		// Re-detect from the start pose to refresh the worklist. If the
+		// previous "pick" was actually a miss (gripper sensor false positive,
+		// dropped in transit), the block is still on the table and reappears
+		// here so the next iteration retries it. Gripper is empty post-place,
+		// so dropHeld=false.
+		if err := w.detectFromStart(ctx, false); err != nil {
+			if w.interrupted(ctx, err) {
+				w.logger.Infof("[%s] re-detection interrupted", w.name)
+				return cycleDone
+			}
+			w.handleCycleErr("re-detection", err)
+			return cycleDone
+		}
 	}
 }
 
@@ -398,7 +415,8 @@ func (w *armWorker) liftDetected(ctx context.Context, label string) error {
 	if grabbed, err := w.gripper.Grab(ctx, nil); err != nil {
 		return err
 	} else if !grabbed {
-		w.logger.Warnf("[%s] gripper reported no object grabbed for %q", w.name, label)
+		w.logger.Warnf("[%s] gripper reported no object grabbed for %q; restarting from inspect pose", w.name, label)
+		return errGripperEmpty
 	}
 	if err := w.sleep(ctx, 250*time.Millisecond); err != nil {
 		return err
