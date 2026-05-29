@@ -403,7 +403,7 @@ func (w *armWorker) tryMoveGripper(ctx context.Context, dest *referenceframe.Pos
 	if err := w.checkInterrupt(ctx); err != nil {
 		return err
 	}
-	w.logger.Debugf("[%s] commanding arm motion: motion.Move to %v", w.name, dest.Pose().Point())
+	w.logger.Infof("[%s] commanding arm motion: motion.Move to %v", w.name, dest.Pose().Point())
 	_, err := w.motion.Move(ctx, motion.MoveReq{
 		ComponentName: w.gripperName(),
 		Destination:   dest,
@@ -435,7 +435,7 @@ func (w *armWorker) setSwitch(ctx context.Context, sw toggleswitch.Switch) error
 	if err := w.checkInterrupt(ctx); err != nil {
 		return err
 	}
-	w.logger.Debugf("[%s] commanding arm motion: switch %q SetPosition", w.name, sw.Name().ShortName())
+	w.logger.Infof("[%s] commanding arm motion: switch %q SetPosition", w.name, sw.Name().ShortName())
 	return sw.SetPosition(ctx, 2, nil)
 }
 
@@ -511,7 +511,7 @@ func (w *armWorker) reset() error {
 	}
 
 	w.motionMu.Lock()
-	w.logger.Debugf("[%s] commanding arm motion: switch %q SetPosition (reset)", w.name, w.startPose.Name().ShortName())
+	w.logger.Infof("[%s] commanding arm motion: switch %q SetPosition (reset)", w.name, w.startPose.Name().ShortName())
 	err := w.startPose.SetPosition(ctx, 2, nil)
 	w.motionMu.Unlock()
 	if err != nil {
