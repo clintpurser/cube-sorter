@@ -101,7 +101,7 @@ func graspYawDegrees(pc pointcloud.PointCloud, approachYaw float64) float64 {
 	if !ok {
 		return normalizeYaw(approachYaw)
 	}
-	return normalizeYaw(edge + approachYaw + 45)
+	return normalizeYaw(edge + approachYaw)
 }
 
 // normalizeYaw folds an angle into (-90, 90] to exploit a cube's 90° symmetry.
