@@ -404,17 +404,17 @@ func (w *armWorker) detectFromStart(ctx context.Context, dropHeld bool) error {
 }
 
 func (w *armWorker) pickOne(ctx context.Context, label string) error {
-	// Re-sense the zone before each placement so cell occupancy reflects
-	// reality (other arm placed here, prior place was off, manual change).
-	// Sense with an empty gripper, before lifting, so the held block doesn't
-	// occlude the camera.
-	if err := w.prepareZone(ctx, label); err != nil {
-		return err
-	}
 	if err := w.liftDetected(ctx, label); err != nil {
 		return err
 	}
 	w.setState(statePlacing)
+	// Re-sense the zone before each placement so cell occupancy reflects
+	// reality (other arm placed here, prior place was off, manual change).
+	// Inspecting with the held block in view is fine — the segmenter ignores
+	// it — and it saves a round trip versus inspecting before the lift.
+	if err := w.prepareZone(ctx, label); err != nil {
+		return err
+	}
 	if err := w.placeInZone(ctx, label); err != nil {
 		return err
 	}

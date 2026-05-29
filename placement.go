@@ -98,8 +98,9 @@ func (w *armWorker) prepareZone(ctx context.Context, label string) error {
 }
 
 // senseZone hovers the camera above the zone and marks cells occupied by
-// detected blocks. Must be called with an empty gripper so the camera isn't
-// occluded.
+// detected blocks. Safe to call with a held block — the inspect_x_offset
+// shifts the camera off-axis enough that a block at the gripper doesn't
+// occlude the zone.
 func (w *armWorker) senseZone(ctx context.Context, z *zoneState) error {
 	origin := z.origin.Point()
 	height := z.cfg.InspectHeight
