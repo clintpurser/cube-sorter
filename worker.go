@@ -177,6 +177,15 @@ func (w *armWorker) runCycleAttempt(ctx context.Context, dropHeld bool) cycleOut
 		w.handleCycleErr("detection", err)
 		return cycleDone
 	}
+
+	// Nothing to pick — skip prepareZones (which would drive to inspect pose for
+	// senseZone) and leave the arm parked at start. placeInZone preps lazily on
+	// the first cycle that has detections.
+	if _, ok := w.nextLabel(); !ok {
+		w.logger.Infof("[%s] no owned objects detected; skipping zone preparation, staying at start", w.name)
+		return cycleComplete
+	}
+
 	if err := w.prepareZones(ctx); err != nil {
 		w.handleCycleErr("zone preparation", err)
 		return cycleDone
