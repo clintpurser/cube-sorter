@@ -148,7 +148,7 @@ func TestConfigUnitsDefaults(t *testing.T) {
 	cfg := &Config{
 		Arms: []ArmUnit{
 			{Arm: "a", Cam: "c", Gripper: "g", Segmenter: "s", StartPose: "h",
-				Zones:      []Zone{{Label: "blue", AnchorPose: "blue-anchor", InspectPose: "blue-inspect", Width: 200, Depth: 200}},
+				Zones:      []Zone{{Label: "blue", Origin: [3]float64{100, 200, 30}, Width: 200, Depth: 200}},
 				CubeHeight: 40},
 		},
 	}
@@ -165,14 +165,14 @@ func TestValidate(t *testing.T) {
 	good := &Config{
 		Arms: []ArmUnit{
 			{Arm: "a", Cam: "c", Gripper: "g", Segmenter: "s", StartPose: "h",
-				Zones: []Zone{{Label: "red", AnchorPose: "red-anchor", InspectPose: "red-inspect", Width: 200, Depth: 150}}},
+				Zones: []Zone{{Label: "red", Origin: [3]float64{350, -120, 30}, Width: 200, Depth: 150}}},
 		},
 	}
 	deps, _, err := good.Validate("")
 	if err != nil {
 		t.Fatalf("valid config rejected: %v", err)
 	}
-	for _, want := range []string{"a", "c", "g", "s", "h", "red-anchor", "red-inspect"} {
+	for _, want := range []string{"a", "c", "g", "s", "h"} {
 		if !contains(deps, want) {
 			t.Errorf("deps missing %q: %v", want, deps)
 		}
@@ -188,7 +188,7 @@ func TestValidate(t *testing.T) {
 	badZone := &Config{
 		Arms: []ArmUnit{
 			{Arm: "a", Cam: "c", Gripper: "g", Segmenter: "s", StartPose: "h",
-				Zones: []Zone{{Label: "red", AnchorPose: "x", InspectPose: "y", Width: 0, Depth: 100}}},
+				Zones: []Zone{{Label: "red", Origin: [3]float64{0, 0, 0}, Width: 0, Depth: 100}}},
 		},
 	}
 	if _, _, err := badZone.Validate(""); err == nil {

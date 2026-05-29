@@ -124,25 +124,9 @@ func (s *sorter) buildWorker(deps resource.Dependencies, unit ArmUnit) (*armWork
 	pitch := unit.BlockSize + unit.Margin
 	zones := map[string]*zoneState{}
 	for _, z := range unit.Zones {
-		var anchor toggleswitch.Switch
-		if z.AnchorPose != "" {
-			anchor, err = toggleswitch.FromProvider(deps, z.AnchorPose)
-			if err != nil {
-				return nil, err
-			}
-		}
-		var inspect toggleswitch.Switch
-		if z.InspectPose != "" {
-			inspect, err = toggleswitch.FromProvider(deps, z.InspectPose)
-			if err != nil {
-				return nil, err
-			}
-		}
 		zones[z.Label] = &zoneState{
-			cfg:     z,
-			anchor:  anchor,
-			inspect: inspect,
-			pitch:   pitch,
+			cfg:   z,
+			pitch: pitch,
 		}
 	}
 

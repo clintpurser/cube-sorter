@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/golang/geo/r3"
-	toggleswitch "go.viam.com/rdk/components/switch"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/spatialmath"
 )
@@ -18,12 +17,10 @@ type zoneCell struct {
 
 // zoneState holds the runtime state for one color's placement zone.
 type zoneState struct {
-	cfg     Zone
-	anchor  toggleswitch.Switch
-	inspect toggleswitch.Switch
-	pitch   float64
+	cfg   Zone
+	pitch float64
 
-	origin spatialmath.Pose // captured anchor world pose; nil until captured
+	origin spatialmath.Pose // grid origin pose (world); built from cfg.Origin on first use
 	cells  []*zoneCell
 }
 
@@ -81,9 +78,9 @@ func abs(v float64) float64 {
 	return v
 }
 
-// prepareZones (re)senses every owned zone while the arm is empty: it captures
-// each anchor's world pose once, builds the grid, then drives to the inspect
-// pose and marks occupied cells. Safe to call at the start of every cycle.
+// prepareZones (re)senses every owned zone while the arm is empty: it builds
+// the grid (on first use) and hovers the camera above each zone to mark
+// occupied cells. Safe to call at the start of every cycle.
 func (w *armWorker) prepareZones(ctx context.Context) error {
 	for label := range w.zones {
 		if err := w.prepareZone(ctx, label); err != nil {
@@ -100,47 +97,29 @@ func (w *armWorker) prepareZone(ctx context.Context, label string) error {
 	}
 
 	if z.origin == nil {
-		if z.cfg.Origin != nil {
-			pt := r3.Vector{X: z.cfg.Origin[0], Y: z.cfg.Origin[1], Z: z.cfg.Origin[2]}
-			z.origin = spatialmath.NewPose(pt, &spatialmath.OrientationVectorDegrees{OZ: -1})
-			z.buildCells()
-			w.logger.Infof("[%s] zone %q origin from config at %v with %d cells", w.name, label, pt, len(z.cells))
-		} else {
-			if err := w.setSwitch(ctx, z.anchor); err != nil {
-				return err
-			}
-			pose, err := w.motion.GetPose(ctx, w.gripperName(), "world", nil, nil)
-			if err != nil {
-				return err
-			}
-			z.origin = pose.Pose()
-			z.buildCells()
-			w.logger.Infof("[%s] zone %q anchored at %v with %d cells", w.name, label, z.origin.Point(), len(z.cells))
-		}
+		pt := r3.Vector{X: z.cfg.Origin[0], Y: z.cfg.Origin[1], Z: z.cfg.Origin[2]}
+		z.origin = spatialmath.NewPose(pt, &spatialmath.OrientationVectorDegrees{OZ: -1})
+		z.buildCells()
+		w.logger.Infof("[%s] zone %q origin from config at %v with %d cells", w.name, label, pt, len(z.cells))
 	}
 
 	return w.senseZone(ctx, z)
 }
 
-// senseZone drives to the inspect pose and marks cells occupied by detected
-// blocks. Must be called with an empty gripper so the camera isn't occluded.
+// senseZone hovers the camera above the zone and marks cells occupied by
+// detected blocks. Must be called with an empty gripper so the camera isn't
+// occluded.
 func (w *armWorker) senseZone(ctx context.Context, z *zoneState) error {
-	if z.inspect != nil {
-		if err := w.setSwitch(ctx, z.inspect); err != nil {
-			return err
-		}
-	} else {
-		origin := z.origin.Point()
-		height := z.cfg.InspectHeight
-		if height == 0 {
-			height = defaultInspectHeightMm
-		}
-		inspectPt := r3.Vector{X: origin.X, Y: origin.Y, Z: origin.Z + height}
-		inspectPose := referenceframe.NewPoseInFrame("world",
-			spatialmath.NewPose(inspectPt, &spatialmath.OrientationVectorDegrees{OZ: -1}))
-		if err := w.moveGripper(ctx, inspectPose, nil, nil); err != nil {
-			return err
-		}
+	origin := z.origin.Point()
+	height := z.cfg.InspectHeight
+	if height == 0 {
+		height = defaultInspectHeightMm
+	}
+	inspectPt := r3.Vector{X: origin.X, Y: origin.Y, Z: origin.Z + height}
+	inspectPose := referenceframe.NewPoseInFrame("world",
+		spatialmath.NewPose(inspectPt, &spatialmath.OrientationVectorDegrees{OZ: -1}))
+	if err := w.moveGripper(ctx, inspectPose, nil, nil); err != nil {
+		return err
 	}
 	if err := w.sleep(ctx, 500*time.Millisecond); err != nil { // settle
 		return err

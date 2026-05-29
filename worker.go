@@ -302,8 +302,8 @@ func (w *armWorker) pickOne(ctx context.Context, label string) error {
 	w.setState(statePicking)
 
 	// Use the world-frame point cloud captured at detection time — the camera
-	// has since moved (anchor / inspect poses), so re-transforming the
-	// camera-frame cloud now would project it through the wrong camera pose.
+	// has since moved (zone inspect poses), so re-transforming the camera-frame
+	// cloud now would project it through the wrong camera pose.
 	objInWorld := obj.WorldPC
 	objMd := objInWorld.MetaData()
 	pickPoint := objMd.Center()
