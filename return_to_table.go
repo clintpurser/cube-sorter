@@ -15,6 +15,12 @@ import (
 // before giving up. Generous for a reasonably sized area.
 const sampleAttempts = 50
 
+// placeRetryAttempts caps how many fresh samples placeWithRetry tries when
+// placeOnTable fails (typically due to a kinematically unreachable goal at the
+// edge of the return area). A new random sample usually lands in a reachable
+// spot.
+const placeRetryAttempts = 5
+
 // returnAreaState holds the runtime state for the table region an arm uses to
 // place blocks when returning them. Unlike zoneState, placements are
 // continuous (random within bounds), not grid-quantized.
@@ -89,12 +95,8 @@ func (w *armWorker) returnBlocksToTable(ctx context.Context, dropHeld bool) erro
 			if err := w.senseReturnArea(ctx); err != nil {
 				return err
 			}
-			pt, err := w.sampleReturnPosition()
-			if err != nil {
-				return err
-			}
 			w.setState(statePlacing)
-			if err := w.placeOnTable(ctx, pt); err != nil {
+			if err := w.placeWithRetry(ctx); err != nil {
 				return err
 			}
 		}
@@ -260,6 +262,32 @@ func farFromAll(pt r3.Vector, others []r3.Vector, minDist float64) bool {
 		}
 	}
 	return true
+}
+
+// placeWithRetry samples a return-area position and places the held block,
+// retrying with fresh samples when placeOnTable fails. IK "unreachable" errors
+// at the edge of the area are the motivating case — a new random sample
+// almost always lands in a reachable spot. Re-sensing is skipped because the
+// table state is unchanged between attempts.
+func (w *armWorker) placeWithRetry(ctx context.Context) error {
+	var lastErr error
+	for attempt := 1; attempt <= placeRetryAttempts; attempt++ {
+		pt, err := w.sampleReturnPosition()
+		if err != nil {
+			return err
+		}
+		if err := w.placeOnTable(ctx, pt); err != nil {
+			if w.interrupted(ctx, err) {
+				return err
+			}
+			w.logger.Warnf("[%s] return: place at (%.1f, %.1f, %.1f) failed (attempt %d/%d): %v",
+				w.name, pt.X, pt.Y, pt.Z, attempt, placeRetryAttempts, err)
+			lastErr = err
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("return: place failed after %d attempts: %w", placeRetryAttempts, lastErr)
 }
 
 // placeOnTable moves a held block to a position in the return area and
