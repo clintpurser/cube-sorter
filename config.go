@@ -19,6 +19,10 @@ type Zone struct {
 	// InspectHeight is how far above Origin (mm) to position the gripper for
 	// occupancy sensing. Defaults to defaultInspectHeightMm.
 	InspectHeight float64 `json:"inspect_height,omitempty"`
+	// InspectXOffset shifts the inspect pose along world X (mm) relative to
+	// Origin so the camera can see the whole area instead of just the patch
+	// directly below it. Defaults to defaultInspectXOffsetMm.
+	InspectXOffset float64 `json:"inspect_x_offset,omitempty"`
 	// Width (along world X) and Depth (along world Y) of the zone, in mm.
 	Width float64 `json:"width"`
 	Depth float64 `json:"depth"`
@@ -69,6 +73,10 @@ const defaultCubeHeight = 30.0
 // defaultInspectHeightMm is how far above the zone origin the gripper is sent
 // for occupancy sensing when InspectHeight is left unset.
 const defaultInspectHeightMm = 200.0
+
+// defaultInspectXOffsetMm shifts the inspect pose back along world X so the
+// camera's FOV covers the whole zone instead of cropping the near edge.
+const defaultInspectXOffsetMm = -50.0
 
 // units returns the arm units with per-unit defaults applied. Viam decodes
 // attributes via mapstructure (json tag names), so defaulting happens here.

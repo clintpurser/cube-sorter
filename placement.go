@@ -115,7 +115,11 @@ func (w *armWorker) senseZone(ctx context.Context, z *zoneState) error {
 	if height == 0 {
 		height = defaultInspectHeightMm
 	}
-	inspectPt := r3.Vector{X: origin.X, Y: origin.Y, Z: origin.Z + height}
+	xOffset := z.cfg.InspectXOffset
+	if xOffset == 0 {
+		xOffset = defaultInspectXOffsetMm
+	}
+	inspectPt := r3.Vector{X: origin.X + xOffset, Y: origin.Y, Z: origin.Z + height}
 	inspectPose := referenceframe.NewPoseInFrame("world",
 		spatialmath.NewPose(inspectPt, &spatialmath.OrientationVectorDegrees{OZ: -1}))
 	if err := w.moveGripper(ctx, inspectPose, nil, nil); err != nil {
