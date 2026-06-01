@@ -165,6 +165,27 @@ func (s *sorter) Name() resource.Name {
 func (s *sorter) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	switch cmd["command"] {
 	case "start":
+		// Optional "phase" override: force every worker into "sort" or "return"
+		// before triggering, instead of resuming whichever phase a prior stop
+		// left them in.
+		if raw, ok := cmd["phase"]; ok {
+			phase, ok := raw.(string)
+			if !ok {
+				return nil, fmt.Errorf("start: 'phase' must be a string (\"sort\" or \"return\")")
+			}
+			var target cyclePhase
+			switch phase {
+			case "sort", "sorting":
+				target = phaseSorting
+			case "return", "returning":
+				target = phaseReturning
+			default:
+				return nil, fmt.Errorf("start: unknown phase %q (want \"sort\" or \"return\")", phase)
+			}
+			for _, w := range s.workers {
+				w.setPhase(target)
+			}
+		}
 		s.logger.Infof("start sorting called on %d arm(s)", len(s.workers))
 		barrier := newCycleBarrier(len(s.workers))
 		for _, w := range s.workers {

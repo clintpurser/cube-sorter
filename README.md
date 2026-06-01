@@ -4,7 +4,7 @@ A pick and place demo built on the Viam platform using computer vision and motio
 colored blocks. It supports **one or more arms**, each with its own gripper and camera, sorting the
 colors it owns. Motion is **serialized** so only one arm moves at a time (collision-free by
 construction), and the routine is **interruptible** — call `stop` to halt mid-motion and hand the
-arms to a teleoperation module, then `resume` to re-detect and continue.
+arms to a teleoperation module, then `start` again to re-detect and continue at the same phase.
 
 ## Features
 
@@ -13,7 +13,7 @@ arms to a teleoperation module, then `resume` to re-detect and continue.
 - Motion planning with constraints for precise arm control
 - Two-finger gripper grasping with PCA-based yaw alignment to the block
 - Multiple arms, each owning a set of block colors; one arm moves at a time
-- Interruptible: `stop` / `resume` for clean teleoperation hand-off
+- Interruptible: `stop` halts cleanly for teleoperation hand-off, then `start` resumes
 
 ## Prerequisites
 
@@ -172,13 +172,19 @@ Begin a full cycle on **every** arm in the background and return immediately. A 
    and places it at a randomized non-overlapping position in its `return_area`, then parks.
 
 Arms move one at a time. `start` while the worker is already in `returning` (e.g. after a mid-return
-`stop`) resumes the return phase instead of restarting sorting. Poll `get_status` to track progress.
+`stop`) resumes the return phase instead of restarting sorting. Pass an optional `phase` to override
+this and force every arm into the named phase before starting. Poll `get_status` to track progress.
 
 ```json
 {
-  "command": "start"
+  "command": "start",
+  "phase": "sort"
 }
 ```
+
+| Field | Type | Inclusion | Description |
+|-------|------|-----------|-------------|
+| `phase` | string | Optional | Force the starting phase: `"sort"` (or `"sorting"`) or `"return"` (or `"returning"`). When omitted, each arm resumes whatever phase it was in. |
 
 Returns:
 ```json
@@ -206,28 +212,6 @@ Returns:
 }
 ```
 
-#### Resume
-
-Clear the stopped state and continue at the phase the arm was in when stopped. If it was in the
-`sorting` phase, each arm returns to its start pose, opens its gripper (to drop any block it was
-holding when stopped), re-detects, and sorts whatever blocks remain. If it was in the `returning`
-phase, the arm parks at start, drops any held block, and resumes returning blocks from its zones to
-its return area. Robust to the arms/blocks having been moved during teleoperation.
-
-```json
-{
-  "command": "resume"
-}
-```
-
-Returns:
-```json
-{
-    "success": <boolean>,
-    "status": "resumed"
-}
-```
-
 #### Get Status
 
 Query per-arm status, current cycle phase, and detected objects. Always returns promptly, even
@@ -235,10 +219,11 @@ mid-pick.
 
 - `status` — fine-grained motion state: `idle` -> `searching_for_objects` -> `objects_detected` ->
   `picking` -> `placing` -> `idle`, or `stopped` / `resetting`.
-- `phase` — which half of the cycle the worker will execute on the next `start` / `resume`:
+- `phase` — which half of the cycle the worker will execute on the next `start`:
   `sorting` (default) or `returning`. The worker transitions to `returning` after a successful sort
   and back to `sorting` after a successful return. Failures and `stop` leave the phase as-is, so a
-  subsequent `start` / `resume` retries the same phase. `reset` forces `sorting`.
+  subsequent `start` retries the same phase. `reset` and `start` with an explicit `phase` force the
+  phase.
 
 ```json
 {
@@ -317,6 +302,27 @@ Returns:
 }
 ```
 
+#### Inspect Zone
+
+Drive the arm that owns `label` to that zone's inspect pose and run a sense pass (logged as
+`N of M cells occupied`), then leave the arm parked there so you can view the camera stream and
+debug placement. The arm is left at the inspect pose — issue another command (e.g. `reset` or
+`start`) to move it away.
+
+```json
+{
+    "command": "inspect_zone",
+    "label": <string>
+}
+```
+
+Returns:
+```json
+{
+    "success": <boolean>
+}
+```
+
 ## Development
 
 ### 1. Clone the Repository
@@ -357,14 +363,14 @@ time, so plans are collision-free by construction.
 9. **Return Home**: Returns the arm to its start pose and continues with the next block.
 
 At any point, `stop` cancels in-flight motion and halts the arms so a teleoperation module can take
-over; `resume` re-detects and continues.
+over; a subsequent `start` re-detects and continues at the same phase.
 
 ## Safety Notes
 
 - Ensure the workspace is clear before running
 - Emergency stop should be readily accessible on the physical robot
-- After `stop`, the module issues no arm commands until `resume`, so a teleoperation module can
-  safely own the arms
+- After `stop`, the module issues no arm commands until the next `start`, so a teleoperation module
+  can safely own the arms
 
 ## License
 
