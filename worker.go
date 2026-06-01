@@ -56,35 +56,78 @@ const (
 )
 
 // cycleBarrier keeps the arms in lockstep at the sort→return boundary. The
-// sorter builds a fresh barrier on every `start` and pushes the same pointer
-// onto each worker's cmdCh, so all participants in one cycle share it.
+// sorter builds one barrier per `start` and pushes the same pointer onto each
+// worker's cmdCh; the barrier is reusable so the worker self-loop continues to
+// rendezvous on it every cycle instead of falling out of sync after the first.
 //
-// Every runCycle invocation calls arrive() exactly once. arrive() decrements a
-// pending count and returns a channel that closes when the count hits zero. A
-// worker about to enter the return phase blocks on that channel; a worker
-// bailing out (sort empty, pick failed, interrupted) still calls arrive() so
-// the count completes and any waiter unblocks instead of hanging.
+// Each runCycle invocation interacts with the barrier exactly once: arrive()
+// on the happy path (in waitForPartner), leave() on any bail path. arrive()
+// counts the caller for the current cycle and returns a channel that closes
+// when every still-expected participant has arrived; once closed, the next
+// arrive() rearms a fresh cycle. leave() permanently removes the caller from
+// the expected count — used when a worker exits its auto-loop (sort empty,
+// interrupt, return failure, mid-cycle barrier swap) so the partner doesn't
+// hang waiting for arrivals that will never come.
 type cycleBarrier struct {
-	mu      sync.Mutex
-	pending int
-	ready   chan struct{}
+	mu       sync.Mutex
+	expected int // participants still tied to this barrier
+	arrived  int // arrivals counted toward the current cycle
+	ready    chan struct{}
 }
 
 func newCycleBarrier(participants int) *cycleBarrier {
 	return &cycleBarrier{
-		pending: participants,
-		ready:   make(chan struct{}),
+		expected: participants,
+		ready:    make(chan struct{}),
 	}
 }
 
+// arrive registers the caller's arrival at the barrier for the current cycle
+// and returns the channel that closes once every expected participant has
+// arrived. If the barrier already released (the previous cycle finished),
+// arrive rearms it with a fresh ready channel before counting the arrival.
+// Each runCycle that reaches the sort→return rendezvous calls arrive exactly
+// once.
 func (b *cycleBarrier) arrive() <-chan struct{} {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.pending--
-	if b.pending == 0 {
+	if b.releasedLocked() {
+		// Previous cycle already released; this arrival starts a new cycle.
+		b.ready = make(chan struct{})
+		b.arrived = 0
+	}
+	b.arrived++
+	if b.arrived >= b.expected {
 		close(b.ready)
 	}
 	return b.ready
+}
+
+// leave permanently removes the caller from the barrier's expected count. Use
+// when a worker won't run more cycles against this barrier — bailed out of a
+// cycle, or swapping to a fresh barrier from a new start. If the current
+// cycle hasn't released yet and the reduced expectation is now met by
+// arrivals so far (or no participants remain at all), release it so any
+// waiter unblocks instead of hanging.
+func (b *cycleBarrier) leave() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.expected <= 0 {
+		return
+	}
+	b.expected--
+	if !b.releasedLocked() && b.arrived >= b.expected {
+		close(b.ready)
+	}
+}
+
+func (b *cycleBarrier) releasedLocked() bool {
+	select {
+	case <-b.ready:
+		return true
+	default:
+		return false
+	}
 }
 
 var pickConstraints = motionplan.Constraints{
@@ -159,10 +202,13 @@ func (w *armWorker) gripperName() string {
 }
 
 // run is the worker's event loop. A start command kicks off one runCycle,
-// after which the worker self-loops with a fresh single-participant barrier
-// for as long as cycles keep completing cleanly (full sort→return, no
-// interrupt). Any other outcome — nothing to sort, interrupt, return failure
-// — drops back to waiting on cmdCh for the next external start.
+// after which the worker self-loops on the SAME barrier so the sort→return
+// rendezvous keeps working every cycle, not just the first. Any non-clean
+// outcome — nothing to sort, interrupt, return failure — drops back to
+// waiting on cmdCh for the next external start. If a new start lands in
+// cmdCh between iterations, the worker leave()s the old barrier (releasing
+// any partner still rendezvousing on it) and adopts the new one so both arms
+// converge onto whichever barrier the most recent start published.
 func (w *armWorker) run(wg *sync.WaitGroup) {
 	defer wg.Done()
 	for {
@@ -170,10 +216,21 @@ func (w *armWorker) run(wg *sync.WaitGroup) {
 		case <-w.parentCtx.Done():
 			return
 		case b := <-w.cmdCh:
-			for completed := w.runCycle(b); completed && !w.stopped.Load(); completed = w.runCycle(newCycleBarrier(1)) {
+			for {
+				if !w.runCycle(b) {
+					break
+				}
+				if w.stopped.Load() {
+					b.leave()
+					break
+				}
 				select {
 				case <-w.parentCtx.Done():
+					b.leave()
 					return
+				case newB := <-w.cmdCh:
+					b.leave()
+					b = newB
 				default:
 				}
 			}
@@ -201,6 +258,10 @@ func (w *armWorker) triggerWith(barrier *cycleBarrier) {
 // over. The gripper is opened at the start pose so any block held over from a
 // prior stop falls onto the table. Returns true only when a full sort→return
 // cycle finishes cleanly — the signal `run` uses to auto-loop the next cycle.
+//
+// Every bail path calls barrier.leave() so the partner arm — which may already
+// be parked at the barrier waiting for us, or about to arrive next cycle —
+// isn't left waiting on a participant that has dropped out.
 func (w *armWorker) runCycle(barrier *cycleBarrier) bool {
 	ctx := w.newOpCtx()
 	w.stopped.Store(false)
@@ -208,9 +269,7 @@ func (w *armWorker) runCycle(barrier *cycleBarrier) bool {
 
 	if w.currentPhase() == phaseSorting {
 		if !w.runSortPhase(ctx, dropHeld) {
-			// Not entering return; release the barrier so the partner arm
-			// doesn't wait for us.
-			barrier.arrive()
+			barrier.leave()
 			w.setState(stateIdle)
 			return false
 		}
@@ -221,12 +280,14 @@ func (w *armWorker) runCycle(barrier *cycleBarrier) bool {
 	}
 
 	if err := w.waitForPartner(ctx, barrier); err != nil {
+		barrier.leave()
 		w.handleCycleErr("sort→return sync", err)
 		w.setState(stateIdle)
 		return false
 	}
 
 	if err := w.returnBlocksToTable(ctx, dropHeld); err != nil {
+		barrier.leave()
 		w.handleCycleErr("return to table", err)
 		w.setState(stateIdle)
 		return false
