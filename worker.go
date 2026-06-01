@@ -317,17 +317,18 @@ func (w *armWorker) waitForPartner(ctx context.Context, barrier *cycleBarrier) e
 	}
 }
 
-// runSortPhase runs the sort loop and reports whether placements happened
-// (true → transition to returning, false → stay in sorting). False covers
-// three cases: nothing was detected, the cycle was interrupted, or pick failed
-// past the restart limit.
+// runSortPhase runs the sort loop and reports whether the phase finished
+// cleanly (true → transition to returning, false → stay in sorting). An empty
+// detection counts as clean completion: there was simply nothing to sort, so
+// the cycle should advance to the return phase. False is reserved for cases
+// where the phase did not finish — interrupt, or unrecoverable pick failure.
 func (w *armWorker) runSortPhase(ctx context.Context, dropHeld bool) bool {
 	for restart := 0; ; restart++ {
 		outcome := w.runCycleAttempt(ctx, dropHeld)
 		switch outcome {
-		case cycleComplete:
+		case cycleComplete, cycleEmpty:
 			return true
-		case cycleEmpty, cycleDone:
+		case cycleDone:
 			return false
 		case cyclePickFailed:
 			w.logger.Warnf("[%s] pick failed (attempt %d); restarting from detection after %v", w.name, restart+1, cycleRestartBackoff)
