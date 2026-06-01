@@ -201,6 +201,18 @@ func (s *sorter) DoCommand(ctx context.Context, cmd map[string]interface{}) (map
 		err := w.pickByLabel(label)
 		return map[string]any{"success": err == nil}, err
 
+	case "inspect_zone":
+		label, ok := cmd["label"].(string)
+		if !ok {
+			return nil, fmt.Errorf("inspect_zone requires a 'label' string parameter")
+		}
+		w := s.workerForLabel(label)
+		if w == nil {
+			return nil, fmt.Errorf("no configured arm owns label %q", label)
+		}
+		err := w.inspectZoneByLabel(label)
+		return map[string]any{"success": err == nil}, err
+
 	case "get_status":
 		return map[string]any{"success": true, "arms": s.aggregateStatus()}, nil
 	}

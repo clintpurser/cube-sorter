@@ -583,6 +583,19 @@ func (w *armWorker) detectOnly() ([]any, error) {
 	return w.serializeDetected(), nil
 }
 
+// inspectZoneByLabel drives the arm to the inspect pose for the zone matching
+// label and runs a sense pass, leaving the arm parked there so the operator
+// can view the camera stream. Useful for debugging placement.
+func (w *armWorker) inspectZoneByLabel(label string) error {
+	ctx := w.newOpCtx()
+	w.stopped.Store(false)
+	if err := w.prepareZone(ctx, label); err != nil {
+		return err
+	}
+	w.setState(stateIdle)
+	return nil
+}
+
 // pickByLabel synchronously picks a single object, detecting and preparing the
 // zone first if needed.
 func (w *armWorker) pickByLabel(label string) error {
