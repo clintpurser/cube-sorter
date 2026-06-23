@@ -32,7 +32,7 @@ type returnAreaState struct {
 
 	// placed accumulates XY positions during the current return phase so we
 	// avoid colliding with our own recent placements even if sensing missed
-	// one. Reset on every returnBlocksToTable call.
+	// one. Reset at the start of each return phase (returnStep's first round).
 	placed []r3.Vector
 	// sensed is the most recent set of XY centers detected in the area;
 	// refreshed by senseReturnArea before each placement.
@@ -47,66 +47,64 @@ func (r *returnAreaState) ensureOrigin() {
 	r.origin = spatialmath.NewPose(pt, &spatialmath.OrientationVectorDegrees{OZ: -1})
 }
 
-// returnBlocksToTable picks every owned block out of its delivery zone and
-// places it at a random non-overlapping position in the return area, then
-// parks at start. If dropHeld is true, the gripper is opened at start pose
-// first so any block held over from a prior stop lands on the table where the
-// next sort cycle will pick it up.
-func (w *armWorker) returnBlocksToTable(ctx context.Context, dropHeld bool) error {
+// returnStep performs one round of the return phase: it scans the arm's zones
+// (stable order) for a block to bring back to the table and, on finding one,
+// lifts it and places it at a free spot in the return area. picked=true means
+// it moved a block; picked=false means every zone scanned clean — the empty
+// signal convergePhase reconciles with the other arm. dropHeld (first round)
+// sheds a block held over from a prior stop and resets the placed-position
+// memory for the new phase.
+func (w *armWorker) returnStep(ctx context.Context, dropHeld bool) (bool, error) {
 	w.returnArea.ensureOrigin()
-	w.returnArea.placed = nil
 
 	if dropHeld {
+		w.returnArea.placed = nil
 		if err := w.setSwitch(ctx, w.startPose); err != nil {
-			return err
+			return false, err
 		}
 		w.logger.Infof("[%s] return: dropping any held block at start", w.name)
 		if err := w.gripper.Open(ctx, nil); err != nil {
-			return err
+			return false, err
 		}
 		if err := w.sleep(ctx, 250*time.Millisecond); err != nil {
-			return err
+			return false, err
 		}
 	}
 
-	for label, z := range w.zones {
+	for _, label := range w.sortedZoneLabels() {
+		z := w.zones[label]
 		ensureZoneOrigin(z)
-		for {
-			if err := w.checkInterrupt(ctx); err != nil {
-				return err
-			}
-			dets, err := w.detectInZone(ctx, z)
-			if err != nil {
-				return err
-			}
-			if len(dets) == 0 {
-				break
-			}
-
-			// Stash the first detection where liftDetected can find it.
-			w.mu.Lock()
-			w.detected = []DetectedObject{dets[0]}
-			w.mu.Unlock()
-
-			if err := w.liftDetected(ctx, label); err != nil {
-				return err
-			}
-
-			if err := w.senseReturnArea(ctx); err != nil {
-				return err
-			}
-			w.setState(statePlacing)
-			if err := w.placeWithRetry(ctx); err != nil {
-				return err
-			}
+		if err := w.checkInterrupt(ctx); err != nil {
+			return false, err
 		}
+		dets, err := w.detectInZone(ctx, z)
+		if err != nil {
+			return false, err
+		}
+		if len(dets) == 0 {
+			continue
+		}
+
+		// Found one. Stash it where liftDetected can find it, bring exactly one
+		// block back, then yield to the reconcile — the next round re-scans.
+		w.mu.Lock()
+		w.detected = []DetectedObject{dets[0]}
+		w.mu.Unlock()
+
+		if err := w.liftDetected(ctx, label); err != nil {
+			return false, err
+		}
+		if err := w.senseReturnArea(ctx); err != nil {
+			return false, err
+		}
+		w.setState(statePlacing)
+		if err := w.placeWithRetry(ctx); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
 
-	w.mu.Lock()
-	w.detected = nil
-	w.mu.Unlock()
-
-	return w.setSwitch(ctx, w.startPose)
+	return false, nil
 }
 
 // ensureZoneOrigin lazily builds a zone's origin pose + grid cells. Mirrors

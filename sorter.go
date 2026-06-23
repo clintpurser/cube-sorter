@@ -152,7 +152,7 @@ func (s *sorter) buildWorker(deps resource.Dependencies, unit ArmUnit) (*armWork
 		client:       s.client,
 		motionMu:     &s.motionMu,
 		parentCtx:    s.cancelCtx,
-		cmdCh:        make(chan *cycleBarrier, 1),
+		cmdCh:        make(chan *convergeBarrier, 1),
 		state:        stateIdle,
 		phase:        phaseSorting,
 	}, nil
@@ -165,15 +165,16 @@ func (s *sorter) Name() resource.Name {
 func (s *sorter) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	switch cmd["command"] {
 	case "start":
-		// Optional "phase" override: force every worker into "sort" or "return"
-		// before triggering, instead of resuming whichever phase a prior stop
-		// left them in.
+		// The per-round consensus requires every arm to be in the same phase, so
+		// `start` puts them all there. Default to sorting; an optional "phase"
+		// override forces "sort" or "return" instead — e.g. to resume a return
+		// that was interrupted without first re-scanning an empty table.
+		target := phaseSorting
 		if raw, ok := cmd["phase"]; ok {
 			phase, ok := raw.(string)
 			if !ok {
 				return nil, fmt.Errorf("start: 'phase' must be a string (\"sort\" or \"return\")")
 			}
-			var target cyclePhase
 			switch phase {
 			case "sort", "sorting":
 				target = phaseSorting
@@ -182,12 +183,12 @@ func (s *sorter) DoCommand(ctx context.Context, cmd map[string]interface{}) (map
 			default:
 				return nil, fmt.Errorf("start: unknown phase %q (want \"sort\" or \"return\")", phase)
 			}
-			for _, w := range s.workers {
-				w.setPhase(target)
-			}
+		}
+		for _, w := range s.workers {
+			w.setPhase(target)
 		}
 		s.logger.Infof("start sorting called on %d arm(s)", len(s.workers))
-		barrier := newCycleBarrier(len(s.workers))
+		barrier := newConvergeBarrier(len(s.workers))
 		for _, w := range s.workers {
 			w.triggerWith(barrier)
 		}

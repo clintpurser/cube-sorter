@@ -55,79 +55,81 @@ const (
 	phaseReturning cyclePhase = "returning"
 )
 
-// cycleBarrier keeps the arms in lockstep at the sort→return boundary. The
-// sorter builds one barrier per `start` and pushes the same pointer onto each
-// worker's cmdCh; the barrier is reusable so the worker self-loop continues to
-// rendezvous on it every cycle instead of falling out of sync after the first.
+// convergeBarrier coordinates the arms' agreement that a phase is finished.
+// Every round, each arm reports whether the source it is clearing came up empty
+// on this pick; the round releases once all arms have reported, carrying
+// whether the round was unanimously empty. A non-unanimous round — some arm
+// still picked a block — sends every arm back for another pick-and-check, so the
+// arms only leave a phase together, on a round where none of them found
+// anything left.
 //
-// Each runCycle invocation interacts with the barrier exactly once: arrive()
-// on the happy path (in waitForPartner), leave() on any bail path. arrive()
-// counts the caller for the current cycle and returns a channel that closes
-// when every still-expected participant has arrived; once closed, the next
-// arrive() rearms a fresh cycle. leave() permanently removes the caller from
-// the expected count — used when a worker exits its auto-loop (sort empty,
-// interrupt, return failure, mid-cycle barrier swap) so the partner doesn't
-// hang waiting for arrivals that will never come.
-type cycleBarrier struct {
-	mu       sync.Mutex
-	expected int // participants still tied to this barrier
-	arrived  int // arrivals counted toward the current cycle
+// The sorter builds one barrier per `start` and pushes the same pointer onto
+// each worker's cmdCh; it is reused for every round of every phase across the
+// continuous self-loop, arming a fresh round each time one completes. leave()
+// permanently drops a participant that has stopped or adopted a newer barrier,
+// so the remaining arms aren't left waiting on a report that will never come.
+type convergeBarrier struct {
+	mu      sync.Mutex
+	total   int  // participants still tied to this barrier
+	arrived int  // reports counted toward the current round
+	anyFull bool // did any arm report non-empty this round?
+	cur     *convRound
+}
+
+// convRound is one reconciliation round. ready closes when every participant
+// has reported; allEmpty is set just before the close and then never mutated,
+// so every waiter reads a stable verdict for that round.
+type convRound struct {
 	ready    chan struct{}
+	allEmpty bool
 }
 
-func newCycleBarrier(participants int) *cycleBarrier {
-	return &cycleBarrier{
-		expected: participants,
-		ready:    make(chan struct{}),
-	}
+func newConvergeBarrier(participants int) *convergeBarrier {
+	return &convergeBarrier{total: participants, cur: &convRound{ready: make(chan struct{})}}
 }
 
-// arrive registers the caller's arrival at the barrier for the current cycle
-// and returns the channel that closes once every expected participant has
-// arrived. If the barrier already released (the previous cycle finished),
-// arrive rearms it with a fresh ready channel before counting the arrival.
-// Each runCycle that reaches the sort→return rendezvous calls arrive exactly
-// once.
-func (b *cycleBarrier) arrive() <-chan struct{} {
+// report records this arm's emptiness for the current round and returns that
+// round. The arm that completes the round (last to report) finalizes the
+// verdict — unanimously empty? — and arms a fresh round before returning.
+func (b *convergeBarrier) report(empty bool) *convRound {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.releasedLocked() {
-		// Previous cycle already released; this arrival starts a new cycle.
-		b.ready = make(chan struct{})
-		b.arrived = 0
-	}
+	r := b.cur
 	b.arrived++
-	if b.arrived >= b.expected {
-		close(b.ready)
+	if !empty {
+		b.anyFull = true
 	}
-	return b.ready
+	if b.arrived >= b.total {
+		b.finishLocked(r)
+	}
+	return r
 }
 
-// leave permanently removes the caller from the barrier's expected count. Use
-// when a worker won't run more cycles against this barrier — bailed out of a
-// cycle, or swapping to a fresh barrier from a new start. If the current
-// cycle hasn't released yet and the reduced expectation is now met by
-// arrivals so far (or no participants remain at all), release it so any
-// waiter unblocks instead of hanging.
-func (b *cycleBarrier) leave() {
+// leave permanently removes the caller from the barrier. Use when a worker
+// won't report further — bailed out on a stop, or swapping to a fresh barrier
+// from a new start. If the smaller quorum is already met by the arms that have
+// reported, the current round is completed so any waiter unblocks instead of
+// hanging.
+func (b *convergeBarrier) leave() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.expected <= 0 {
+	if b.total <= 0 {
 		return
 	}
-	b.expected--
-	if !b.releasedLocked() && b.arrived >= b.expected {
-		close(b.ready)
+	b.total--
+	if b.total > 0 && b.arrived >= b.total {
+		b.finishLocked(b.cur)
 	}
 }
 
-func (b *cycleBarrier) releasedLocked() bool {
-	select {
-	case <-b.ready:
-		return true
-	default:
-		return false
-	}
+// finishLocked resolves round r — recording whether it was unanimously empty —
+// and arms a fresh round for the next pick. The caller must hold mu.
+func (b *convergeBarrier) finishLocked(r *convRound) {
+	r.allEmpty = !b.anyFull
+	close(r.ready)
+	b.arrived = 0
+	b.anyFull = false
+	b.cur = &convRound{ready: make(chan struct{})}
 }
 
 var pickConstraints = motionplan.Constraints{
@@ -183,7 +185,7 @@ type armWorker struct {
 
 	// lifecycle
 	parentCtx context.Context
-	cmdCh     chan *cycleBarrier
+	cmdCh     chan *convergeBarrier
 
 	// interrupt control
 	stopped  atomic.Bool
@@ -202,13 +204,14 @@ func (w *armWorker) gripperName() string {
 }
 
 // run is the worker's event loop. A start command kicks off one runCycle,
-// after which the worker self-loops on the SAME barrier so the sort→return
-// rendezvous keeps working every cycle, not just the first. Any non-clean
-// outcome — nothing to sort, interrupt, return failure — drops back to
-// waiting on cmdCh for the next external start. If a new start lands in
-// cmdCh between iterations, the worker leave()s the old barrier (releasing
-// any partner still rendezvousing on it) and adopts the new one so both arms
-// converge onto whichever barrier the most recent start published.
+// after which the worker self-loops on the SAME barrier so the per-round
+// consensus keeps coordinating every cycle, not just the first. Transient
+// failures (a failed pick, a stale-camera sensing error) back off and retry
+// inside runCycle, so the loop only drops back to waiting on cmdCh when a stop
+// interrupts it. If a new start lands in cmdCh between iterations, the worker
+// leave()s the old barrier (releasing any partner still reconciling on it) and
+// adopts the new one so both arms converge onto whichever barrier the most
+// recent start published.
 func (w *armWorker) run(wg *sync.WaitGroup) {
 	defer wg.Done()
 	for {
@@ -239,56 +242,39 @@ func (w *armWorker) run(wg *sync.WaitGroup) {
 }
 
 // triggerWith requests a new cycle without blocking, handing the worker the
-// barrier that synchronizes it with its partner at the sort→return boundary.
-// Duplicate requests while a cycle is already running are dropped — the
-// already-queued barrier takes effect for the next cycle.
-func (w *armWorker) triggerWith(barrier *cycleBarrier) {
+// barrier that reconciles it with its partner each round. Duplicate requests
+// while a cycle is already running are dropped — the already-queued barrier
+// takes effect for the next cycle.
+func (w *armWorker) triggerWith(barrier *convergeBarrier) {
 	select {
 	case w.cmdCh <- barrier:
 	default:
 	}
 }
 
-// runCycle dispatches one start command to the right phase. Sort completion
-// transitions the worker to the returning phase; if the worker was already in
-// the returning phase (e.g. stopped mid-return, then started again), it skips
-// the sort. Both code paths then wait at the shared barrier so both arms
-// enter the return phase together. Failures in either phase leave the phase
-// unchanged so the next command retries the same phase rather than starting
-// over. The gripper is opened at the start pose so any block held over from a
-// prior stop falls onto the table. Returns true only when a full sort→return
-// cycle finishes cleanly — the signal `run` uses to auto-loop the next cycle.
-//
-// Every bail path calls barrier.leave() so the partner arm — which may already
-// be parked at the barrier waiting for us, or about to arrive next cycle —
-// isn't left waiting on a participant that has dropped out.
-func (w *armWorker) runCycle(barrier *cycleBarrier) bool {
+// runCycle runs one sort→return cycle under the shared convergence barrier.
+// Each phase advances only when every arm agrees its source is empty (see
+// convergePhase), which also keeps the arms moving into the next phase together
+// — so the barrier no longer needs a separate sort→return rendezvous. A worker
+// resumed already in the returning phase skips the sort half. Returns true when
+// a full sort→return cycle completes by consensus — the signal `run` uses to
+// auto-loop — or false if a stop interrupts a phase, after leaving the barrier
+// so the partner isn't left waiting on a participant that has dropped out.
+func (w *armWorker) runCycle(barrier *convergeBarrier) bool {
 	ctx := w.newOpCtx()
 	w.stopped.Store(false)
-	dropHeld := true
 
 	if w.currentPhase() == phaseSorting {
-		if !w.runSortPhase(ctx, dropHeld) {
+		if !w.convergePhase(ctx, barrier, phaseSorting) {
 			barrier.leave()
 			w.setState(stateIdle)
 			return false
 		}
 		w.setPhase(phaseReturning)
-		// Sort already parked at start with the gripper empty; the return
-		// phase doesn't need to drop a held block.
-		dropHeld = false
 	}
 
-	if err := w.waitForPartner(ctx, barrier); err != nil {
+	if !w.convergePhase(ctx, barrier, phaseReturning) {
 		barrier.leave()
-		w.handleCycleErr("sort→return sync", err)
-		w.setState(stateIdle)
-		return false
-	}
-
-	if err := w.returnBlocksToTable(ctx, dropHeld); err != nil {
-		barrier.leave()
-		w.handleCycleErr("return to table", err)
 		w.setState(stateIdle)
 		return false
 	}
@@ -297,112 +283,114 @@ func (w *armWorker) runCycle(barrier *cycleBarrier) bool {
 	return true
 }
 
-// waitForPartner signals arrival at the sort→return barrier and blocks until
-// the partner arm also arrives (or signals it isn't returning). Honors
-// ctx/stop so a stop request unblocks the wait.
-func (w *armWorker) waitForPartner(ctx context.Context, barrier *cycleBarrier) error {
-	ready := barrier.arrive()
-	select {
-	case <-ready:
-		return w.checkInterrupt(ctx)
-	default:
-	}
-	w.logger.Infof("[%s] sort complete; waiting for partner arm", w.name)
-	w.setState(stateWaitingForPartner)
-	select {
-	case <-ready:
-		return w.checkInterrupt(ctx)
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-// runSortPhase runs the sort loop and reports whether the phase finished
-// cleanly (true → transition to returning, false → stay in sorting). An empty
-// detection counts as clean completion: there was simply nothing to sort, so
-// the cycle should advance to the return phase. False is reserved for cases
-// where the phase did not finish — interrupt, or unrecoverable pick failure.
-func (w *armWorker) runSortPhase(ctx context.Context, dropHeld bool) bool {
-	for restart := 0; ; restart++ {
-		outcome := w.runCycleAttempt(ctx, dropHeld)
-		switch outcome {
-		case cycleComplete, cycleEmpty:
-			return true
-		case cycleDone:
-			return false
-		case cyclePickFailed:
-			w.logger.Warnf("[%s] pick failed (attempt %d); restarting from detection after %v", w.name, restart+1, cycleRestartBackoff)
-			// A partial pick may have left a block in the gripper; drop it.
-			dropHeld = true
-			if err := w.sleep(ctx, cycleRestartBackoff); err != nil {
+// convergePhase runs one phase as a sequence of single-pick rounds. Each round
+// the arm picks at most one block from the source it is clearing, then
+// reconciles with the other arm(s) at the barrier; the phase ends only on a
+// round where every arm's source came up empty. So no arm leaves while another
+// still has blocks, and — because each arm re-senses its source every round —
+// a block that appears late, or a prior empty reading that was a transient
+// miss, is caught before the arms move on. Transient pick/sense failures back
+// off and retry the round; only a stop (interrupt) ends the phase early.
+// Returns true when the phase completes by consensus, false on interrupt.
+func (w *armWorker) convergePhase(ctx context.Context, barrier *convergeBarrier, phase cyclePhase) bool {
+	dropHeld := true // first round sheds any block held over from a prior stop
+	for {
+		picked, err := w.phaseStep(ctx, phase, dropHeld)
+		if err != nil {
+			if w.interrupted(ctx, err) {
+				w.logger.Infof("[%s] %s interrupted", w.name, phase)
 				return false
 			}
+			// Transient failure (stale camera frame, blocked motion, missed
+			// grab): back off and retry the round rather than abandoning the
+			// phase. dropHeld on retry sheds a block a partial pick may have
+			// left in the gripper.
+			w.logger.Warnf("[%s] %s step failed; retrying after %v: %v", w.name, phase, cycleRestartBackoff, err)
+			if serr := w.sleep(ctx, cycleRestartBackoff); serr != nil {
+				return false
+			}
+			dropHeld = true
+			continue
+		}
+		dropHeld = false
+
+		allEmpty, err := w.reconcile(ctx, barrier, !picked, phase)
+		if err != nil {
+			return false
+		}
+		if allEmpty {
+			return true
 		}
 	}
 }
 
-type cycleOutcome int
+// reconcile reports this arm's emptiness for the current round and blocks until
+// every arm has reported, returning whether the round was unanimously empty.
+// Honors ctx/stop so a stop unblocks the wait.
+func (w *armWorker) reconcile(ctx context.Context, barrier *convergeBarrier, empty bool, phase cyclePhase) (bool, error) {
+	round := barrier.report(empty)
+	select {
+	case <-round.ready:
+		return w.roundVerdict(ctx, round)
+	default:
+	}
+	if empty {
+		w.logger.Infof("[%s] %s: nothing left; waiting for other arm", w.name, phase)
+		w.setState(stateWaitingForPartner)
+	}
+	select {
+	case <-round.ready:
+		return w.roundVerdict(ctx, round)
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
 
-const (
-	cycleComplete   cycleOutcome = iota // all detected objects processed (success or per-label drop)
-	cycleDone                           // terminated (interrupt or unrecoverable error); caller should return
-	cyclePickFailed                     // pickOne failed; caller may restart from detection
-	cycleEmpty                          // no owned objects detected at start; nothing to do
-)
+// roundVerdict reads a completed round's outcome, mapping a stop that landed
+// during the wait to an interrupt error.
+func (w *armWorker) roundVerdict(ctx context.Context, round *convRound) (bool, error) {
+	if err := w.checkInterrupt(ctx); err != nil {
+		return false, err
+	}
+	return round.allEmpty, nil
+}
 
-func (w *armWorker) runCycleAttempt(ctx context.Context, dropHeld bool) cycleOutcome {
+// phaseStep performs one round's worth of work for the given phase: sense the
+// source and pick at most one block. Returns picked=true if it moved a block,
+// false if the source came up empty this round.
+func (w *armWorker) phaseStep(ctx context.Context, phase cyclePhase, dropHeld bool) (bool, error) {
+	if phase == phaseSorting {
+		return w.sortStep(ctx, dropHeld)
+	}
+	return w.returnStep(ctx, dropHeld)
+}
+
+// sortStep senses owned blocks from the start pose and picks a single one into
+// its zone. picked=false means the table held none of this arm's colors this
+// round. dropHeld (first round) drops a block held over from a prior stop.
+func (w *armWorker) sortStep(ctx context.Context, dropHeld bool) (bool, error) {
 	if err := w.detectFromStart(ctx, dropHeld); err != nil {
-		w.handleCycleErr("detection", err)
-		return cycleDone
+		return false, err
 	}
-
-	// Nothing to pick — leave the arm parked at start. Each pickOne re-senses
-	// its target zone before lifting, so we don't need an upfront pass here.
-	if _, ok := w.nextLabel(); !ok {
-		w.logger.Infof("[%s] no owned objects detected; staying at start", w.name)
-		return cycleEmpty
+	label, ok := w.nextLabel()
+	if !ok {
+		return false, nil
 	}
-
-	for {
-		if err := w.checkInterrupt(ctx); err != nil {
-			w.logger.Infof("[%s] cycle interrupted before next pick", w.name)
-			return cycleDone
-		}
-		label, ok := w.nextLabel()
-		if !ok {
-			return cycleComplete
-		}
-		if err := w.pickOne(ctx, label); err != nil {
-			if w.interrupted(ctx, err) {
-				w.logger.Infof("[%s] pick interrupted", w.name)
-				return cycleDone
-			}
-			w.logger.Errorf("[%s] failed to pick %q: %v", w.name, label, err)
-			return cyclePickFailed
-		}
-		// Re-detect from the start pose to refresh the worklist. If the
-		// previous "pick" was actually a miss (gripper sensor false positive,
-		// dropped in transit), the block is still on the table and reappears
-		// here so the next iteration retries it. Gripper is empty post-place,
-		// so dropHeld=false.
-		if err := w.detectFromStart(ctx, false); err != nil {
-			if w.interrupted(ctx, err) {
-				w.logger.Infof("[%s] re-detection interrupted", w.name)
-				return cycleDone
-			}
-			w.handleCycleErr("re-detection", err)
-			return cycleDone
-		}
+	if err := w.pickOne(ctx, label); err != nil {
+		return false, err
 	}
+	return true, nil
 }
 
-func (w *armWorker) handleCycleErr(phase string, err error) {
-	if errors.Is(err, errStopped) || errors.Is(err, context.Canceled) {
-		w.logger.Infof("[%s] %s interrupted", w.name, phase)
-		return
+// sortedZoneLabels returns this arm's zone labels in a stable order so the
+// return phase scans zones deterministically from round to round.
+func (w *armWorker) sortedZoneLabels() []string {
+	labels := make([]string, 0, len(w.zones))
+	for label := range w.zones {
+		labels = append(labels, label)
 	}
-	w.logger.Warnf("[%s] %s failed: %v", w.name, phase, err)
-	w.setState(stateIdle)
+	slices.Sort(labels)
+	return labels
 }
 
 // detectFromStart drives the arm to its start pose, optionally drops a held
